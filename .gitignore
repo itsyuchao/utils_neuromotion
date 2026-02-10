@@ -1,0 +1,68 @@
+############################
+# Python core
+############################
+__pycache__/
+*.py[cod]
+*.so
+
+############################
+# Editable installs / packaging
+############################
+*.egg-info/
+dist/
+build/
+
+############################
+# Virtual environments
+############################
+.venv/
+venv/
+env/
+ENV/
+
+############################
+# Jupyter / notebooks
+############################
+.ipynb_checkpoints/
+
+############################
+# VS Code
+############################
+.vscode/
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/tasks.json
+
+############################
+# macOS
+############################
+.DS_Store
+
+############################
+# Linux / HPC
+############################
+*~
+.nfs*
+.core
+
+############################
+# Logs / temp
+############################
+*.log
+*.tmp
+*.swp
+
+############################
+# Project-specific derivatives
+############################
+derivatives/
+outputs/
+results/
+cache/
+.tmp/
+.png
+.pdf
+.fif 
+.nii.gz
+.env
+
