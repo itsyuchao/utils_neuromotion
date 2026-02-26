@@ -1,5 +1,6 @@
 from __future__ import annotations
 import numpy as np
+import mne
 
 def calc_speed(data, diff_step=1, smoothing=10):
     """
@@ -304,7 +305,7 @@ def extract_band_phase(signal, l_freq, h_freq, sfreq=250, method='morlet', n_job
 
     return band_phase # should be same dimension as input signal
 
-def apply_morlet(signal, sfreq=250, freqs=None, output='power', rescale=None, baseline=None, n_jobs=4):
+def apply_morlet(signal: np.array, sfreq=250, freqs=None, output='power', rescale=None, baseline=None, n_jobs=4):
     """
     Apply Morlet wavelet transform to a signal and return the power spectrum.
 

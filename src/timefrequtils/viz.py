@@ -1,6 +1,6 @@
 
 from __future__ import annotations
-
+import logging 
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Iterable, Optional
@@ -131,19 +131,27 @@ def plot_tfr(power_data, times, freqs=None, ax=None, vmin=-5, vmax=5, cmap='jet'
             ymax = freqs[-1]
         
         # Plot TFR with log2 scale for frequency axis
-        im = ax.imshow(
-            power_data, 
-            origin='lower', 
-            aspect='auto',
-            extent=[times[0], times[-1], ymin, ymax],
-            interpolation='bilinear',
-            vmin=vmin, vmax=vmax,
-            cmap=cmap
-        )
+        if y_scale == 'log2':
+            im = ax.imshow(
+                power_data,
+                origin='lower',
+                aspect='auto',
+                extent=[times[0], times[-1], ymin, ymax],
+                interpolation='bilinear',
+                vmin=vmin, vmax=vmax,
+                cmap=cmap
+            )
+        elif y_scale == 'linear':
+            im = ax.pcolormesh(
+                times, freqs, power_data,
+                vmin=vmin, vmax=vmax,
+                cmap=cmap,
+                shading='gouraud'
+            )
         
         if y_scale == 'log2':
-            # Set y-axis ticks for frequency in log2 scale
-            ytick_freqs = [2, 4, 8, 16, 32, 64]
+            all_tick_freqs = np.array([1, 2, 4, 8, 16, 32, 64, 128])
+            ytick_freqs = all_tick_freqs[(all_tick_freqs >= freqs[0]) & (all_tick_freqs <= freqs[-1])]
             yticks = np.log2(ytick_freqs)
             ax.set_yticks(yticks)
             ax.set_yticklabels(ytick_freqs)
@@ -168,6 +176,12 @@ def plot_tfr(power_data, times, freqs=None, ax=None, vmin=-5, vmax=5, cmap='jet'
         if title is not None:
             ax.set_title(title)
         return im
+
+def save_fig(path: Path, fig=None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    (fig or plt.gcf()).savefig(path, bbox_inches="tight", dpi=300)
+    logging.info("Saved: %s", path)
+    plt.close(fig or plt.gcf())
 
 # Example usage
 if __name__ == "__main__":
