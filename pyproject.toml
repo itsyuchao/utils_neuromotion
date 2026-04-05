@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "timefrequtils"
+name = "neuromotion"
 version = "0.1.0"
-description = "Utilities for ieeg time-frequency analysis"
+description = "for human eeg/ieeg time-frequency analysis with synchronized behavior"
 dependencies = [
   "numpy",
   "scipy",
