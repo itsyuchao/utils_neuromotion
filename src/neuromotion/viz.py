@@ -320,7 +320,7 @@ def plot_gait_tfr(
 
         for i, (ep, info) in enumerate(zip(epochs, cycle_info)):
             if ieeg_picks is not None:
-                ep = _pick_or_reref(ep, ieeg_picks)
+                ep = pick_or_reref(ep, ieeg_picks)
             data = ep.get_data()
 
             tfr = apply_morlet(data, sfreq=sfreq, freqs=freqs, output="power",
@@ -698,7 +698,7 @@ def plot_path_overlay_gait_lean(
 
     lc = LineCollection(segs, colors=seg_colors, linewidths=2, alpha=alpha)
     ax.add_collection(lc)
-    ax.autoscale()
+    ax.axis("equal")
     ax.set_xlabel(f"{motion_xy[0]} (m)")
     ax.set_ylabel(f"{motion_xy[1]} (m)")
     if subplot_title is not None:

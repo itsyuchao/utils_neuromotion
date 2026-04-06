@@ -173,7 +173,11 @@ def annot_gait_lean(
 
     # merge with existing annotations
     if raw_motion.annotations is not None and len(raw_motion.annotations):
-        print("Warning: raw_motion already has annotations. Check for conflicts. Not writing new annotations.")
+        print("Warning: raw_motion already has annotations. Checking for conflicts.")
+        if set(raw_motion.annotations.description) & set(gait_annot.description):
+            print("Warning: existing annotations have overlapping descriptions with gait_lean. Not adding new annotations.")
+        else:
+            raw_motion.set_annotations(raw_motion.annotations + gait_annot)
     else:
         raw_motion.set_annotations(gait_annot)
 
