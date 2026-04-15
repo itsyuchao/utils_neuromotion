@@ -8,6 +8,7 @@ from matplotlib import colors as mcolors
 from typing import Iterable, Optional
 import mne
 
+from neuromotion import annot
 from neuromotion.io import pick_or_reref
 from neuromotion.calc import extract_band_power, apply_morlet
 
@@ -670,8 +671,8 @@ def plot_path_overlay_gait_lean(
     for annot in raw_motion.annotations:
         if annot["description"] not in color_map:
             continue
-        i_start = int(round(annot["onset"] * sfreq))
-        i_end = int(round((annot["onset"] + annot["duration"]) * sfreq))
+        i_start = int(round((annot["onset"] - raw_motion.first_time) * sfreq))
+        i_end   = int(round((annot["onset"] + annot["duration"] - raw_motion.first_time) * sfreq))
         i_start = max(0, i_start)
         i_end = min(n_times, i_end)
         sample_color[i_start:i_end] = color_map[annot["description"]]

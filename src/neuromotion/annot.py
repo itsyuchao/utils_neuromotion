@@ -2,11 +2,105 @@ import mne
 import numpy as np
 from matplotlib import pyplot as plt
 
+def annot_gait_lean(                                                                          
+    raw_motion,                                                                               
+    motion_xy=["pos_z", "pos_x"],                                                             
+    direction_smooth_s=1.5,                                                                   
+    lean_smooth_s=0.1,                                                          
+    min_event_duration_s=0.3,                                                                 
+) -> mne.io.RawArray:                                                                         
+    """                                                                                       
+    Add gait_lean_left / gait_lean_right / gait_lean_reset annotations                        
+    to raw_motion (in-place) and return it.                                                   
+                                                                                                
+    Sign convention (2-D cross product T × offset):                                           
+        lean > 0  →  position is LEFT  of the smoothed trajectory                               
+        lean < 0  →  position is RIGHT of the smoothed trajectory                               
+    """                                                                                       
+    sfreq = float(raw_motion.info["sfreq"])
+    first_time = raw_motion.first_time                                                   
+    dt = 1.0 / sfreq                                                                          
+    n_times = raw_motion.n_times                                                              
+                                                                                                                                                            
+    data = raw_motion.get_data(picks=motion_xy)                                                                                                          
+    x = data[0]                                                                                                                              
+    y = data[1]                                                                                                                            
+                                                                                                                                                            
+    # ── smoothed heading path (edge-padded to avoid boundary artifacts) ──                                                                              
+    smooth_win = max(1, int(round(direction_smooth_s * sfreq)))                                                                                          
+    kernel = np.ones(smooth_win) / smooth_win                                                                                                            
+    x_s = np.convolve(np.pad(x, smooth_win // 2, mode="reflect", reflect_type='odd'), kernel, mode="valid")[:n_times]                                                           
+    y_s = np.convolve(np.pad(y, smooth_win // 2, mode="reflect", reflect_type='odd'), kernel, mode="valid")[:n_times]                                                           
+                                                                                                                                                            
+    # ── trajectory direction (heading angle of smoothed path) ────────────                                                                            
+    dx_s = np.gradient(x_s, dt)                                                                                                                            
+    dy_s = np.gradient(y_s, dt)                                                                                                     
+    heading = np.arctan2(dy_s, dx_s)  # -pi - pi
+
+    # ── raw heading from unsmoothed data ─────────────────────────────────
+    dx_raw = np.gradient(x, dt)
+    dy_raw = np.gradient(y, dt)
+    heading_raw = np.arctan2(dy_raw, dx_raw)
+
+    # ── angular deviation: how much raw path "leans" off smooth heading ──
+    lean = heading_raw - heading
+    # wrap so no extreme spikes due to arctan -pi to pi boundary
+    lean = (lean + np.pi) % (2 * np.pi) - np.pi   
+
+    # tiny smoothing to denoise lean vector
+    l_smooth_win = max(1, int(round(lean_smooth_s * sfreq)))
+    l_kernel = np.ones(l_smooth_win) / l_smooth_win
+    lean = np.convolve(np.pad(lean, l_smooth_win // 2, mode="reflect", reflect_type='odd'), l_kernel, mode="valid")[:n_times]                                                                                                                                                                
+                                                                                                                                                            
+    # ── state: -1 left, +1 right ───────────────────────                                                                               
+    state = np.zeros(n_times, dtype=int)                                                                                                                 
+    state[(lean > 0)] = -1   # left of path                                                                                                   
+    state[(lean < 0)] =  1   # right of path    
+
+    # ── contiguous runs → annotations ───────────────────────────────────                                                                               
+    labels = {-1: "gait_lean_left", 0: "gait_lean_reset", 1: "gait_lean_right"}                                                                          
+    min_samp = max(1, int(round(min_event_duration_s * sfreq)))                                                                                          
+                                                                                                                                                            
+    onsets, durations, descriptions = [], [], []                                                                                                         
+    run_start = 0                                                                                                                                        
+    run_val = state[0]                                      
+
+    for i in range(1, n_times):                                                               
+        if state[i] != run_val or i == n_times - 1:                                           
+            run_len = i - run_start                                                           
+            if i == n_times - 1 and state[i] == run_val:                                      
+                run_len += 1                                                                  
+            if run_len >= min_samp:                                                           
+                onsets.append(run_start / sfreq)                                              
+                durations.append(run_len / sfreq)                                             
+                descriptions.append(labels[run_val])                                          
+            run_start = i                                                                     
+            run_val = state[i]                                                             
+                                                                                                
+    gait_annot = mne.Annotations(                                                             
+        onset=[o + first_time for o in onsets],                                                                         
+        duration=durations,                                                                   
+        description=descriptions,                                                             
+        orig_time=raw_motion.info["meas_date"],                                               
+    )                                                                                         
+                                                                                                                                                            
+    # ── merge: replace any existing gait_lean_* annotations ─────────────                                                                               
+    if raw_motion.annotations is not None and len(raw_motion.annotations):                                                                               
+        replace_desc = set(gait_annot.description)                                                                                                       
+        keep_mask = [d not in replace_desc for d in raw_motion.annotations.description]                                                                  
+        kept_annots = raw_motion.annotations[keep_mask]                                                                                                  
+        raw_motion.set_annotations(kept_annots + gait_annot)                                                                                             
+    else:                                                                                                                                                
+        raw_motion.set_annotations(gait_annot)                                                                                                           
+                                                                                                                                                            
+    return raw_motion                       
+
+
 def annot_gait_cycles(
     raw_motion,
     raw_ieeg,
     cycle_min_dur=0.5,
-    cycle_max_dur=1.5,
+    cycle_max_dur=1.8,
     pad_s=0.5,
 )->tuple[list[mne.io.RawArray], list[dict]]:
     """
@@ -23,14 +117,23 @@ def annot_gait_cycles(
     """
     sfreq_ieeg = float(raw_ieeg.info["sfreq"])
 
-    # --- collect left and right segments ---
+    # Check synchronization 
+    motion_ft = raw_motion.first_time
+    ieeg_ft = raw_ieeg.first_time
+    if abs(motion_ft - ieeg_ft) > 0.01:
+        print(f"Warning: raw_motion and raw_ieeg have different first_time "
+              f"({motion_ft:.2f}s vs {ieeg_ft:.2f}s). "
+              f"Check if they are properly aligned in time.")
+
+    # --- collect left and right segments in relative time ---
     left_segs = []
     right_segs = []
     for annot in raw_motion.annotations:
+        onset_rel = annot["onset"] - motion_ft  # now array-relative
         if annot["description"] == "gait_lean_left":
-            left_segs.append((annot["onset"], annot["duration"]))
+            left_segs.append((onset_rel, annot["duration"]))
         elif annot["description"] == "gait_lean_right":
-            right_segs.append((annot["onset"], annot["duration"]))
+            right_segs.append((onset_rel, annot["duration"]))
 
     left_segs.sort(key=lambda x: x[0])
     right_segs.sort(key=lambda x: x[0])
@@ -62,12 +165,11 @@ def annot_gait_cycles(
     epochs = []
     cycle_info = []
 
-    for onset, dur in cycles:
-        t_start = onset - pad_s
-        t_end = onset + dur + pad_s
+    for onset_rel, dur in cycles:
+        t_start = onset_rel - pad_s
+        t_end = onset_rel + dur + pad_s
 
-        data_dur = raw_ieeg.n_times / sfreq_ieeg
-        if t_start < 0 or t_end > data_dur:
+        if t_start < ieeg_ft or t_end > ieeg_ft + raw_ieeg.n_times / sfreq_ieeg:
             continue
 
         epoch_raw = raw_ieeg.copy().crop(tmin=t_start, tmax=t_end, include_tmax=False)
@@ -76,7 +178,7 @@ def annot_gait_cycles(
         pad_samp = int(round(pad_s * sfreq_ieeg))
         cycle_samp = epoch_raw.n_times - 2 * pad_samp
         cycle_info.append({
-            "onset": onset,
+            "onset": onset_rel,
             "duration": dur,
             "pad_s": pad_s,
             "sfreq": sfreq_ieeg,
@@ -88,97 +190,3 @@ def annot_gait_cycles(
     print(f"Extracted {len(epochs)} valid gait cycles "
           f"({cycle_min_dur}-{cycle_max_dur}s) from {len(cycles)} candidates")
     return epochs, cycle_info
-
-def annot_gait_lean(
-    raw_motion,
-    motion_xy=["pos_z", "pos_x"],
-    direction_smooth_s=2.0,
-    lean_smooth_s=0.1,
-    cadence_range=(0.8, 2.0),
-    cadence_check_window_s=0.6,
-    min_event_duration_s=0.3,
-)->mne.io.RawArray:
-    """
-    Add gait_lean_left / gait_lean_right / gait_lean_reset annotations
-    to raw_motion (in-place) and return it.
-    """
-    sfreq = float(raw_motion.info["sfreq"])
-    dt = 1.0 / sfreq
-    n_times = raw_motion.n_times
-
-    data = raw_motion.get_data(picks=motion_xy)
-    x = data[0] / 1000.0
-    y = data[1] / 1000.0
-
-    # smoothed heading
-    smooth_win = max(1, int(round(direction_smooth_s * sfreq)))
-    kernel = np.ones(smooth_win) / smooth_win
-    x_s = np.convolve(x, kernel, mode="same")
-    y_s = np.convolve(y, kernel, mode="same")
-    heading_smooth = np.arctan2(np.gradient(y_s, dt), np.gradient(x_s, dt))
-
-    # instantaneous heading
-    lean_win = max(1, int(round(lean_smooth_s * sfreq)))
-    kernel_l = np.ones(lean_win) / lean_win
-    x_l = np.convolve(x, kernel_l, mode="same")
-    y_l = np.convolve(y, kernel_l, mode="same")
-    heading_inst = np.arctan2(np.gradient(y_l, dt), np.gradient(x_l, dt))
-
-    # signed lean
-    lean = np.sin(heading_inst - heading_smooth)
-
-    # periodicity gating
-    check_win = int(round(cadence_check_window_s * sfreq))
-    half_win = check_win // 2
-    is_valid = np.zeros(n_times, dtype=bool)
-    zero_crossings = np.where(np.diff(np.sign(lean)) != 0)[0]
-
-    for i in range(half_win, n_times - half_win):
-        mask = (zero_crossings >= i - half_win) & (zero_crossings < i + half_win)
-        freq = mask.sum() / (2.0 * cadence_check_window_s) # within the cadence check window, how many zero crossings /2 to get cycles
-        if cadence_range[0] <= freq <= cadence_range[1]:
-            is_valid[i] = True 
-
-    # state: -1 left, 0 reset, +1 right
-    state = np.zeros(n_times, dtype=int)
-    state[is_valid & (lean > 0)] = -1
-    state[is_valid & (lean <= 0)] = 1
-
-    # contiguous runs -> annotations
-    labels = {-1: "gait_lean_left", 0: "gait_lean_reset", 1: "gait_lean_right"}
-    min_samp = max(1, int(round(min_event_duration_s * sfreq)))
-
-    onsets, durations, descriptions = [], [], []
-    run_start = 0
-    run_val = state[0]
-
-    for i in range(1, n_times):
-        if state[i] != run_val or i == n_times - 1:
-            run_len = i - run_start
-            if i == n_times - 1 and state[i] == run_val:
-                run_len += 1
-            if run_len >= min_samp:
-                onsets.append(run_start / sfreq)
-                durations.append(run_len / sfreq)
-                descriptions.append(labels[run_val])
-            run_start = i
-            run_val = state[i]
-
-    gait_annot = mne.Annotations(
-        onset=onsets,
-        duration=durations,
-        description=descriptions,
-        orig_time=raw_motion.info["meas_date"],
-    )
-
-    # merge with existing annotations
-    if raw_motion.annotations is not None and len(raw_motion.annotations):
-        print("Warning: raw_motion already has annotations. Checking for conflicts.")
-        if set(raw_motion.annotations.description) & set(gait_annot.description):
-            print("Warning: existing annotations have overlapping descriptions with gait_lean. Not adding new annotations.")
-        else:
-            raw_motion.set_annotations(raw_motion.annotations + gait_annot)
-    else:
-        raw_motion.set_annotations(gait_annot)
-
-    return raw_motion
