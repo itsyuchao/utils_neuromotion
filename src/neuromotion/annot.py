@@ -1,6 +1,7 @@
 import mne 
 import numpy as np
 from matplotlib import pyplot as plt
+import datetime
 
 def annot_gait_lean(                                                                          
     raw_motion,                                                                               
@@ -44,10 +45,7 @@ def annot_gait_lean(
 
     # ── angular deviation: how much raw path "leans" off smooth heading ──
     lean = heading_raw - heading
-    # wrap so no extreme spikes due to arctan -pi to pi boundary
-    lean = (lean + np.pi) % (2 * np.pi) - np.pi   
-
-    # tiny smoothing to denoise lean vector
+    lean = (lean + np.pi) % (2 * np.pi) - np.pi   # wrap so no extreme spikes due to arctan -pi to pi boundary
     l_smooth_win = max(1, int(round(lean_smooth_s * sfreq)))
     l_kernel = np.ones(l_smooth_win) / l_smooth_win
     lean = np.convolve(np.pad(lean, l_smooth_win // 2, mode="reflect", reflect_type='odd'), l_kernel, mode="valid")[:n_times]                                                                                                                                                                
@@ -99,7 +97,7 @@ def annot_gait_lean(
 def annot_gait_cycles(
     raw_motion,
     raw_ieeg,
-    cycle_min_dur=0.5,
+    cycle_min_dur=0.6,
     cycle_max_dur=1.8,
     pad_s=0.5,
 )->tuple[list[mne.io.RawArray], list[dict]]:
@@ -118,22 +116,24 @@ def annot_gait_cycles(
     sfreq_ieeg = float(raw_ieeg.info["sfreq"])
 
     # Check synchronization 
-    motion_ft = raw_motion.first_time
-    ieeg_ft = raw_ieeg.first_time
-    if abs(motion_ft - ieeg_ft) > 0.01:
+    motion_first = raw_motion.first_time
+    motion_start_iso = raw_motion.info["meas_date"] + datetime.timedelta(seconds=motion_first)
+    ieeg_first = raw_ieeg.first_time
+    ieeg_start_iso = raw_ieeg.info["meas_date"] + datetime.timedelta(seconds=ieeg_first) 
+    if abs(motion_start_iso - ieeg_start_iso) > datetime.timedelta(seconds=0.01): 
         print(f"Warning: raw_motion and raw_ieeg have different first_time "
-              f"({motion_ft:.2f}s vs {ieeg_ft:.2f}s). "
+              f"({motion_first:.2f}s vs {ieeg_first:.2f}s). "
               f"Check if they are properly aligned in time.")
 
-    # --- collect left and right segments in relative time ---
+    # --- collect left and right segments in ieeg time ---
     left_segs = []
     right_segs = []
     for annot in raw_motion.annotations:
-        onset_rel = annot["onset"] - motion_ft  # now array-relative
+        onset = annot["onset"] - motion_first + ieeg_first  # now ieeg_time
         if annot["description"] == "gait_lean_left":
-            left_segs.append((onset_rel, annot["duration"]))
+            left_segs.append((onset, annot["duration"]))
         elif annot["description"] == "gait_lean_right":
-            right_segs.append((onset_rel, annot["duration"]))
+            right_segs.append((onset, annot["duration"]))
 
     left_segs.sort(key=lambda x: x[0])
     right_segs.sort(key=lambda x: x[0])
@@ -165,11 +165,11 @@ def annot_gait_cycles(
     epochs = []
     cycle_info = []
 
-    for onset_rel, dur in cycles:
-        t_start = onset_rel - pad_s
-        t_end = onset_rel + dur + pad_s
+    for onset, dur in cycles:
+        t_start = onset - ieeg_first - pad_s
+        t_end = onset - ieeg_first + dur + pad_s
 
-        if t_start < ieeg_ft or t_end > ieeg_ft + raw_ieeg.n_times / sfreq_ieeg:
+        if t_start < 0 or t_end > raw_ieeg.times[-1]:
             continue
 
         epoch_raw = raw_ieeg.copy().crop(tmin=t_start, tmax=t_end, include_tmax=False)
@@ -178,7 +178,7 @@ def annot_gait_cycles(
         pad_samp = int(round(pad_s * sfreq_ieeg))
         cycle_samp = epoch_raw.n_times - 2 * pad_samp
         cycle_info.append({
-            "onset": onset_rel,
+            "onset": onset,
             "duration": dur,
             "pad_s": pad_s,
             "sfreq": sfreq_ieeg,
