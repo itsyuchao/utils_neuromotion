@@ -639,6 +639,7 @@ def plot_path_overlay_rhythmicity(
 
 def plot_path_overlay_gait_lean(
     raw_motion,
+    annot_type="gait_lean",
     motion_xy=("pos_z", "pos_x"),
     window_s=0.05,
     cmap_left="#e53935",
@@ -649,8 +650,13 @@ def plot_path_overlay_gait_lean(
     alpha=0.8,
 ):
     """
-    Plot walking path colored by gait lean annotations already on raw_motion.
-    Expects annotations: 'gait_lean_left', 'gait_lean_right', 'gait_lean_reset'.
+    Plot walking path colored by left/right phase annotations on raw_motion.
+
+    Parameters
+    ----------
+    annot_type : str
+        "gait_lean" → consumes gait_lean_left/_right/_reset (annot_gait_lean).
+        "lr_step"   → consumes lr_step_left/_right/_reset (annot_lr_step).
     """
     sfreq = float(raw_motion.info["sfreq"])
     n_times = raw_motion.n_times
@@ -662,9 +668,9 @@ def plot_path_overlay_gait_lean(
 
     # build per-sample color label from annotations
     color_map = {
-        "gait_lean_left": cmap_left,
-        "gait_lean_right": cmap_right,
-        "gait_lean_reset": color_reset,
+        f"{annot_type}_left":  cmap_left,
+        f"{annot_type}_right": cmap_right,
+        f"{annot_type}_reset": color_reset,
     }
     sample_color = np.full(n_times, color_reset, dtype=object)
 
@@ -707,9 +713,9 @@ def plot_path_overlay_gait_lean(
 
     from matplotlib.lines import Line2D
     ax.legend(handles=[
-        Line2D([0], [0], color=cmap_left, lw=2, label="Left lean"),
-        Line2D([0], [0], color=cmap_right, lw=2, label="Right lean"),
-        Line2D([0], [0], color=color_reset, lw=2, label="Reset"),
+        Line2D([0], [0], color=cmap_left,  lw=2, label=f"{annot_type}_left"),
+        Line2D([0], [0], color=cmap_right, lw=2, label=f"{annot_type}_right"),
+        Line2D([0], [0], color=color_reset, lw=2, label=f"{annot_type}_reset"),
     ], loc="best", fontsize=9)
 
     return ax
