@@ -315,3 +315,78 @@ def annot_gait_cycles(
     print(f"Extracted {len(epochs)} valid gait cycles from '{annot_type}' "
           f"({cycle_min_dur}-{cycle_max_dur}s) from {len(cycles)} candidates")
     return epochs, cycle_info
+
+
+def annot_cue_cycles(
+    raw,
+    periods,
+    cycle_len_s,
+    pad_s=0.5,
+) -> tuple[list[mne.io.RawArray], list[dict]]:
+    """
+    Subdivide each absolute-time period into fixed-length cue cycles and
+    crop raw segments around them. Output format mirrors annot_gait_cycles:
+    a list of padded epoch segments and a list of cycle_info dicts.
+
+    IMPORTANT: the returned epochs are NOT time-adjusted to the cycle core.
+    Each epoch spans ``[cycle_start - pad_s, cycle_end + pad_s]`` so that a
+    downstream Morlet / Hilbert transform sees the pads as buffer against
+    edge artifacts. The cycle_info dict carries ``cycle_start_idx`` and
+    ``cycle_end_idx`` which the caller is expected to use AFTER the
+    frequency-domain transform to trim the pads. See
+    ``cycles_to_bandpower_matrix`` and ``cycles_to_tfr_stack`` for the
+    matching downstream steps.
+
+    Parameters
+    ----------
+    raw : mne.io.BaseRaw
+        Continuous recording to crop from.
+    periods : iterable of (t0, t1)
+        Absolute raw times (i.e. including ``raw.first_time``) demarcating
+        the parent periods (e.g. Beep_ON / Beep_OFF / baseline blocks).
+    cycle_len_s : float
+        Core length of each cue cycle (without pads).
+    pad_s : float
+        Padding before and after each cycle. Should match what the caller
+        plans to trim in ``cycle_info['cycle_start_idx':'cycle_end_idx']``.
+
+    Returns
+    -------
+    epochs : list of mne.io.RawArray
+        Padded segments (NOT time-adjusted -- pads are still present).
+    cycle_info : list of dict
+        Per-cycle metadata: 'sfreq', 'pad_s', 'duration', 'onset',
+        'cycle_start_idx', 'cycle_end_idx', 'n_samples', 'period_idx'.
+    """
+    sfreq = float(raw.info["sfreq"])
+    raw_ft = raw.first_time
+    pad_samp = int(round(pad_s * sfreq))
+    epochs, cycle_info = [], []
+    periods = list(periods)
+
+    for i, (t0, t1) in enumerate(periods):
+        n_cycles = int(np.floor((t1 - t0) / cycle_len_s))
+        for k in range(n_cycles):
+            c0 = t0 + k * cycle_len_s
+            c1 = c0 + cycle_len_s
+            tmin = c0 - raw_ft - pad_s
+            tmax = c1 - raw_ft + pad_s
+            if tmin < 0 or tmax > raw.times[-1]:
+                continue
+            ep = raw.copy().crop(tmin=tmin, tmax=tmax, include_tmax=False)
+            n_samples = ep.n_times
+            cycle_info.append({
+                "sfreq": sfreq,
+                "pad_s": pad_s,
+                "duration": cycle_len_s,
+                "onset": c0,
+                "cycle_start_idx": pad_samp,
+                "cycle_end_idx": n_samples - pad_samp,
+                "n_samples": n_samples,
+                "period_idx": i,
+            })
+            epochs.append(ep)
+
+    print(f"Extracted {len(epochs)} cue cycles ({cycle_len_s:.3f}s each) "
+          f"from {len(periods)} periods")
+    return epochs, cycle_info

@@ -10,7 +10,7 @@ import mne
 
 from neuromotion import annot
 from neuromotion.io import pick_or_reref
-from neuromotion.calc import extract_band_power, apply_morlet
+from neuromotion.calc import extract_band_power, apply_morlet, cycles_to_tfr_stack
 
 def save_fig(path: Path, fig=None):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -102,14 +102,24 @@ def plot_head(sensor_coord, sensor_val=np.arange(63), ax=None, label_off=True, c
         ax.set_frame_on(False)  # Optional: removes the axis border
     return ax
 
-def plot_tfr(power_data, times, freqs=None, ax=None, vmin=-5, vmax=5, cmap='jet', y_scale='log2', title=None):
+def plot_tfr(power_data, times, freqs=None, ax=None, vmin=-5, vmax=5, cmap='jet',
+             y_scale='log2', title=None,
+             cluster_alpha=0.05,
+             contour_color='k', contour_lw=1.0,
+             cluster_kwargs=None):
         """
         Plot time-frequency representation data.
-        
+
         Parameters
         ----------
-        power_data : array, shape (n_freqs, n_times)
-            The power data to plot
+        power_data : array
+            Either 2D (n_freqs, n_times) -- plotted directly --
+            or 3D (n_obs, n_freqs, n_times). When 3D, the first axis is treated
+            as the observation axis; the mean across observations is plotted,
+            and an MNE one-sample cluster permutation test with TFCE is run
+            against zero. Cluster boundaries with p < ``cluster_alpha`` are
+            drawn as smooth contour outlines on top of the smooth
+            bilinear / gouraud background.
         times : array, shape (n_times,)
             Time points in seconds
         freqs : array, shape (n_freqs,)
@@ -122,27 +132,65 @@ def plot_tfr(power_data, times, freqs=None, ax=None, vmin=-5, vmax=5, cmap='jet'
             Colormap name
         title : str | None
             Title for the plot
-            
+        cluster_alpha : float
+            P-value threshold for considering a cluster significant
+            (only used when ``power_data`` is 3D and has >=2 observations).
+        contour_color : str
+            Color of the significant-cluster outline.
+        contour_lw : float
+            Line width of the contour outline.
+        cluster_kwargs : dict | None
+            Extra kwargs forwarded to
+            ``mne.stats.permutation_cluster_1samp_test``. Defaults to
+            ``dict(threshold=dict(start=0, step=0.2), tail=0, n_jobs=1,
+                   out_type='mask', verbose=False)``.
+
         Returns
         -------
         im : matplotlib.image.AxesImage
             The image object
-        """        
+        """
         if ax is None:
             fig, ax = plt.subplots(1, 1, figsize=(8, 6))
-        
-        if freqs is None: 
+
+        # 3D input -> mean + TFCE cluster correction
+        sig_mask = None
+        if power_data.ndim == 3:
+            obs_data = np.asarray(power_data)
+            mean_data = obs_data.mean(axis=0)
+            if obs_data.shape[0] >= 2:
+                from mne.stats import permutation_cluster_1samp_test
+                kw = dict(threshold=dict(start=0, step=0.2), tail=0, n_jobs=1,
+                          out_type='mask', verbose=False)
+                if cluster_kwargs:
+                    kw.update(cluster_kwargs)
+                _, clusters, cluster_pv, _ = permutation_cluster_1samp_test(
+                    obs_data, **kw
+                )
+                sig_mask = np.zeros(mean_data.shape, dtype=bool)
+                for cl, p in zip(clusters, np.asarray(cluster_pv).ravel()):
+                    if p < cluster_alpha:
+                        cl_arr = np.asarray(cl)
+                        if cl_arr.dtype == bool and cl_arr.shape == mean_data.shape:
+                            sig_mask |= cl_arr
+                        else:
+                            sig_mask[tuple(cl_arr.T) if cl_arr.ndim == 2 else cl_arr] = True
+            power_data = mean_data
+        elif power_data.ndim != 2:
+            raise ValueError(f"power_data must be 2D or 3D, got {power_data.ndim}D")
+
+        if freqs is None:
             freqs = 2 ** np.arange(0,7,0.1)
             freqs = freqs[freqs <= 90]  # Limit to 90 Hz due to amplifier settings
 
-        if y_scale == 'log2': 
+        if y_scale == 'log2':
             ymin = np.log2(freqs[0])
             ymax = np.log2(freqs[-1])
         elif y_scale == 'linear':
             ymin = freqs[0]
             ymax = freqs[-1]
-        
-        # Plot TFR with log2 scale for frequency axis
+
+        # Smooth background (bilinear / gouraud, full opacity).
         if y_scale == 'log2':
             im = ax.imshow(
                 power_data,
@@ -151,15 +199,24 @@ def plot_tfr(power_data, times, freqs=None, ax=None, vmin=-5, vmax=5, cmap='jet'
                 extent=[times[0], times[-1], ymin, ymax],
                 interpolation='bilinear',
                 vmin=vmin, vmax=vmax,
-                cmap=cmap
+                cmap=cmap,
             )
         elif y_scale == 'linear':
             im = ax.pcolormesh(
                 times, freqs, power_data,
                 vmin=vmin, vmax=vmax,
                 cmap=cmap,
-                shading='gouraud'
+                shading='gouraud',
             )
+
+        # Significant-cluster outline: contour at the True/False boundary of
+        # sig_mask. Marching squares gives a smooth outline on top of the
+        # smooth background -- no opacity hack needed.
+        if sig_mask is not None and sig_mask.any():
+            y_coords = np.log2(freqs) if y_scale == 'log2' else freqs
+            ax.contour(times, y_coords, sig_mask.astype(float),
+                       levels=[0.5], colors=contour_color,
+                       linewidths=contour_lw)
         
         if y_scale == 'log2':
             all_tick_freqs = np.array([1, 2, 4, 8, 16, 32, 64, 128])
@@ -174,15 +231,15 @@ def plot_tfr(power_data, times, freqs=None, ax=None, vmin=-5, vmax=5, cmap='jet'
             ax.set_yticklabels(ytick_freqs)
         
         # Label axes
-        ax.set_ylabel('Frequency (Hz)')
-        ax.set_xlabel('Time (s)')
+        ax.set_ylabel('frequency (Hz)')
+        ax.set_xlabel('time (s)')
         
         # Add vertical line at time=0
         ax.axvline(x=0, color='w', linestyle='--')
 
         # Add colorbar
         cbar = plt.colorbar(im, ax=ax)
-        cbar.set_label('Power (Z-score)', rotation=270, labelpad=15)
+        cbar.set_label('power (z)', rotation=270, labelpad=15)
 
         # Add title if provided
         if title is not None:
@@ -229,7 +286,7 @@ def plot_psd_for_raws(raw_path_list, channel_picks=None,
             ax.plot(freqs, psd_db, color=base_color, alpha=alpha,
                     linewidth=1.5, label=label)
 
-    ax.set_xlabel("Frequency (Hz)")
+    ax.set_xlabel("frequency (Hz)")
     ax.set_ylabel("PSD (dB)")
     ax.set_title(f"Power Spectrum per {int(segment_dur)}s Segment")
     ax.legend(loc="upper right", fontsize=9)
@@ -238,7 +295,7 @@ def plot_psd_for_raws(raw_path_list, channel_picks=None,
     fig.tight_layout()
     return fig, ax
 
-def plot_gait_tfr(
+def plot_cycles_tfr(
     epochs: list[mne.io.RawArray],
     cycle_info,
     ieeg_picks=None,
@@ -255,12 +312,12 @@ def plot_gait_tfr(
     ax=None
 ):
     """
-    Plot TFR of gait-cycle epochs.
+    Plot TFR of cycle epochs (gait cycles, cue cycles, or any cycle-based segments).
 
     Parameters
     ----------
-    epochs : list of mne.io.RawArray from epoch_gait_cycles
-    cycle_info : list of dict from epoch_gait_cycles, read pad_s to crop 
+    epochs : list of mne.io.RawArray from epoch_gait_cycles / annot_cue_cycles
+    cycle_info : list of dict from the same source, read pad_s to crop
     ieeg_picks : list of str or None
         Channel names to pick and average. None uses all. Able to reref if picks are bipolar pairs.
     mode : 'average' or 'individual'
@@ -270,7 +327,8 @@ def plot_gait_tfr(
         Passed to apply_morlet ('zscore', 'mean', 'sd', None).
         Baseline is the pre-pad window.
     n_interp : int
-        Time points for normalized cycle axis in average mode.
+        Time points for normalized cycle axis in average mode. The x-axis is
+        a normalized cycle on [0, 1] regardless of n_interp or sfreq.
     """
     if not epochs:
         print("No epochs to plot.")
@@ -316,39 +374,21 @@ def plot_gait_tfr(
         return fig, axes
 
     elif mode == "average":
-        n_freqs = len(freqs)
-        tfr_stack = []
-
-        for i, (ep, info) in enumerate(zip(epochs, cycle_info)):
-            if ieeg_picks is not None:
-                ep = pick_or_reref(ep, ieeg_picks)
-            data = ep.get_data()
-
-            tfr = apply_morlet(data, sfreq=sfreq, freqs=freqs, output="power",
-                               rescale=baseline_mode, baseline=baseline, n_jobs=n_jobs)
-            tfr = tfr.squeeze(axis=0).mean(axis=0)  # (n_freq, n_samples)
-
-            # crop pads (computed with pads to avoid edge effects)
-            tfr = tfr[:, pad_samp:-pad_samp]
-            n_samp = tfr.shape[-1]
-
-            # interpolate each freq to n_interp points so all cycles align
-            tfr_interp = np.zeros((n_freqs, n_interp))
-            x_orig = np.linspace(0, 1, n_samp)
-            x_norm = np.linspace(0, 1, n_interp)
-            for fi in range(n_freqs):
-                tfr_interp[fi] = np.interp(x_norm, x_orig, tfr[fi])
-
-            tfr_stack.append(tfr_interp)
-
-        tfr_mean = np.mean(tfr_stack, axis=0)
-        t_norm = np.linspace(0, n_interp/sfreq, n_interp)
+        # Explicit pipeline: per-cycle TFR -> 3D stack -> plot_tfr (auto cluster correction).
+        tfr_stack, freqs = cycles_to_tfr_stack(
+            epochs, cycle_info, ch_name=ieeg_picks,
+            freqs=freqs, n_interp=n_interp,
+            rescale=baseline_mode, baseline=baseline, n_jobs=n_jobs,
+        )
+        # Cycles are time-warped to a normalized [0, 1] axis; n_interp only
+        # controls resolution, not duration.
+        t_norm = np.linspace(0, 1, n_interp)
 
         fig, ax = plt.subplots(figsize=(10, 5)) if ax is None else (None, ax)
-        plot_tfr(tfr_mean, t_norm, freqs=freqs, ax=ax,
+        plot_tfr(tfr_stack, t_norm, freqs=freqs, ax=ax,
                  vmin=vmin, vmax=vmax, cmap=cmap,
-                 title=f"Average gait cycle TFR (n={len(tfr_stack)})")
-        ax.set_xlabel("Normalized gait cycle")
+                 title=f"Average cycle TFR (n={tfr_stack.shape[0]})")
+        ax.set_xlabel("Normalized cycle")
 
         return fig, ax
 
@@ -705,7 +745,7 @@ def plot_path_overlay_gait_lean(
 
     lc = LineCollection(segs, colors=seg_colors, linewidths=2, alpha=alpha)
     ax.add_collection(lc)
-    ax.axis("equal")
+    ax.autoscale()
     ax.set_xlabel(f"{motion_xy[0]} (m)")
     ax.set_ylabel(f"{motion_xy[1]} (m)")
     if subplot_title is not None:

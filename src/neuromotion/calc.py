@@ -2,6 +2,8 @@ from __future__ import annotations
 import numpy as np
 import mne
 
+from neuromotion.io import pick_or_reref
+
 def calc_speed(data, diff_step=1, smoothing=10):
     """
     Compute Euclidean derivatives from x, y coordinates in a 2-column NumPy array.
@@ -304,6 +306,137 @@ def extract_band_phase(signal, l_freq, h_freq, sfreq=250, method='morlet', n_job
         band_phase = band_phase.squeeze()
 
     return band_phase # should be same dimension as input signal
+
+def cycles_to_bandpower_matrix(epochs, cycle_info, ch_name,
+                               l_freq, h_freq,
+                               n_interp=100,
+                               rescale="zscore",
+                               method="morlet",
+                               n_jobs=4):
+    """
+    Build a (n_interp, n_cycles) band-power matrix from cycle epoch segments.
+
+    ``epochs`` are NOT time-adjusted: they are full padded segments as
+    produced by ``annot_gait_cycles`` / ``annot_cue_cycles``. The pad
+    indices live in ``cycle_info`` and are applied AFTER the frequency
+    transform to avoid Morlet/Hilbert edge artifacts.
+
+    Per-cycle pipeline (explicit, each step independently meaningful):
+        1) pick_or_reref(ep, ch_name)
+        2) extract_band_power on the FULL padded segment
+        3) crop pads with cycle_info[k]['cycle_start_idx':'cycle_end_idx']
+        4) np.interp the core onto a length-``n_interp`` axis
+
+    Parameters
+    ----------
+    epochs : list of mne.io.RawArray
+        Padded segments (e.g. from annot_gait_cycles / annot_cue_cycles).
+    cycle_info : list of dict
+        One per epoch. Must carry 'sfreq', 'cycle_start_idx', 'cycle_end_idx'.
+    ch_name : str | list of str
+        Channel(s) to pick / re-reference. Multi-channel results are mean-collapsed.
+    l_freq, h_freq : float
+        Band edges in Hz.
+    n_interp : int
+        Length of the normalized cycle axis.
+    rescale : str | None
+        Passed to extract_band_power (e.g. 'zscore').
+    method : str
+        'morlet' or 'hilbert' -- passed through to extract_band_power.
+
+    Returns
+    -------
+    mat : np.ndarray, shape (n_interp, n_cycles)
+        Empty (n_interp, 0) if no cycles supplied.
+    """
+    x_norm = np.linspace(0, 1, n_interp)
+    traces = []
+    for ep, ci in zip(epochs, cycle_info):
+        ep_picked = pick_or_reref(ep, ch_name)
+        data = ep_picked.get_data()  # (n_ch, n_samples_padded)
+        power = extract_band_power(
+            data, l_freq=l_freq, h_freq=h_freq,
+            sfreq=ci["sfreq"], rescale=rescale, method=method, n_jobs=n_jobs,
+        )
+        if power.ndim == 1:
+            power = power[np.newaxis, :]
+        # mean across channels if multiple, then trim pads with explicit indices
+        core = power.mean(axis=0)[ci["cycle_start_idx"]:ci["cycle_end_idx"]]
+        x_orig = np.linspace(0, 1, len(core))
+        traces.append(np.interp(x_norm, x_orig, core))
+    if not traces:
+        return np.empty((n_interp, 0))
+    return np.array(traces).T  # (n_interp, n_cycles)
+
+
+def cycles_to_tfr_stack(epochs, cycle_info, ch_name=None,
+                        freqs=None, n_interp=250,
+                        rescale="zscore", baseline=None,
+                        n_jobs=4):
+    """
+    Build a (n_cycles, n_freqs, n_interp) Morlet-TFR stack from cycle epoch segments.
+
+    Same conventions as ``cycles_to_bandpower_matrix``:
+    epochs are full padded segments, pads are trimmed AFTER the Morlet
+    transform using ``cycle_info`` indices, then each frequency row is
+    interpolated to a common length-``n_interp`` axis.
+
+    Per-cycle pipeline (explicit):
+        1) pick_or_reref(ep, ch_name)  (skip if ch_name is None)
+        2) apply_morlet on the FULL padded segment
+        3) mean across channels -> (n_freqs, n_samples_padded)
+        4) crop pads with cycle_info[k]['cycle_start_idx':'cycle_end_idx']
+        5) np.interp each freq row onto a length-``n_interp`` axis
+
+    Parameters
+    ----------
+    epochs : list of mne.io.RawArray
+    cycle_info : list of dict   (must carry 'sfreq', 'cycle_start_idx', 'cycle_end_idx')
+    ch_name : str | list of str | None
+        None -> use all channels of each epoch (mean across channels).
+    freqs : array-like | None
+        Defaults to log2-spaced 4..90 Hz (matches plot_tfr default range).
+    n_interp : int
+        Length of the normalized cycle axis.
+    rescale, baseline : passed to apply_morlet.
+
+    Returns
+    -------
+    stack : np.ndarray, shape (n_cycles, n_freqs, n_interp)
+        Empty (0, n_freqs, n_interp) if no cycles supplied.
+    freqs : np.ndarray
+        Frequency points used.
+    """
+    if freqs is None:
+        freqs = 2 ** np.arange(2, 7, 0.1)
+        freqs = freqs[freqs <= 90]
+    freqs = np.asarray(freqs)
+    n_freqs = len(freqs)
+    x_norm = np.linspace(0, 1, n_interp)
+
+    stack = []
+    for ep, ci in zip(epochs, cycle_info):
+        ep_used = pick_or_reref(ep, ch_name) if ch_name is not None else ep
+        data = ep_used.get_data()  # (n_ch, n_samples_padded)
+        tfr = apply_morlet(
+            data, sfreq=ci["sfreq"], freqs=freqs, output="power",
+            rescale=rescale, baseline=baseline, n_jobs=n_jobs,
+        )
+        # (1, n_ch, n_freqs, n_samples_padded) -> (n_freqs, n_samples_padded)
+        tfr = tfr.squeeze(axis=0).mean(axis=0)
+        # explicit pad trim using cycle_info indices
+        tfr = tfr[:, ci["cycle_start_idx"]:ci["cycle_end_idx"]]
+        n_samp = tfr.shape[-1]
+        tfr_interp = np.zeros((n_freqs, n_interp))
+        x_orig = np.linspace(0, 1, n_samp)
+        for fi in range(n_freqs):
+            tfr_interp[fi] = np.interp(x_norm, x_orig, tfr[fi])
+        stack.append(tfr_interp)
+
+    if not stack:
+        return np.empty((0, n_freqs, n_interp)), freqs
+    return np.array(stack), freqs
+
 
 def apply_morlet(signal: np.array, sfreq=250, freqs=None, output='power', rescale=None, baseline=None, n_jobs=4, verbose=False):
     """
