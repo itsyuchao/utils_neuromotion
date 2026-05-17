@@ -1,7 +1,95 @@
 from __future__ import annotations
+import datetime
 import numpy as np
 import warnings
 import mne
+
+
+def assert_iso_synced(*raws, tolerance_s: float = 0.01, labels=None) -> None:
+    """Verify that all raws share start wallclock and duration to tolerance_s.
+
+    Use this whenever downstream code (annotation copy, gait/cue cycle
+    cropping, event conversion) crosses raw boundaries. The check enforces
+    that ``meas_date + first_time`` and total duration agree across all
+    inputs, so subsequent code may treat raw-relative seconds as
+    interchangeable with wallclock-since-meas_date offsets.
+
+    Parameters
+    ----------
+    *raws : mne.io.BaseRaw
+        Two or more raws expected to be ISO-wallclock aligned (e.g. all
+        outputs of a single sync run for the same task).
+    tolerance_s : float
+        Max allowed mismatch in either start time or total duration.
+    labels : list[str] | None
+        Human-readable labels for error messages.
+
+    Raises
+    ------
+    ValueError
+        If ``meas_date`` is missing on any raw, or start time / duration
+        differ across raws by more than ``tolerance_s``.
+    """
+    if len(raws) < 2:
+        return
+    labels = list(labels) if labels else [f"raw{i}" for i in range(len(raws))]
+    if len(labels) != len(raws):
+        raise ValueError("labels length must match number of raws")
+
+    starts, durs = [], []
+    for r, lbl in zip(raws, labels):
+        md = r.info["meas_date"]
+        if md is None:
+            raise ValueError(
+                f"{lbl}.info['meas_date'] is None -- cannot verify ISO sync. "
+                f"Run the sync step that sets meas_date before chunking across raws."
+            )
+        starts.append(md + datetime.timedelta(seconds=r.first_time))
+        durs.append(r.times[-1])
+
+    s0, d0 = starts[0], durs[0]
+    for s, d, lbl in zip(starts[1:], durs[1:], labels[1:]):
+        ds = abs((s - s0).total_seconds())
+        dd = abs(d - d0)
+        if ds > tolerance_s:
+            raise ValueError(
+                f"start-wallclock mismatch beyond tolerance "
+                f"({ds:.4f}s > {tolerance_s}s): "
+                f"{labels[0]}={s0.isoformat()} vs {lbl}={s.isoformat()}"
+            )
+        if dd > tolerance_s:
+            raise ValueError(
+                f"duration mismatch beyond tolerance "
+                f"({dd:.4f}s > {tolerance_s}s): "
+                f"{labels[0]}={d0:.3f}s vs {lbl}={d:.3f}s"
+            )
+
+
+def antneuro_ucla_63ch() -> mne.channels.DigMontage:
+    """Custom 63-channel antNeuro montage used in the UCLA recordings.
+
+    Derived from MNE's biosemi64: drops the four channels not recorded
+    (Fpz, CPz, Iz, P9, P10) and adds the four h-suffixed temporal channels
+    (FTT9h, FTT10h, TPP9h, TPP10h) as the midpoint of their named
+    neighbors, shifted 1 cm inferior (z - 0.01).
+    """
+    base = mne.channels.make_standard_montage("biosemi64")
+    src = base.get_positions()["ch_pos"]
+    ch_pos = {k: v.copy() for k, v in src.items()}
+    for ch in ("Fpz", "CPz", "Iz", "P9", "P10"):
+        ch_pos.pop(ch, None)
+
+    def _mid_inferior(a, b, drop=0.01):
+        p = (np.asarray(src[a]) + np.asarray(src[b])) / 2.0
+        p[2] -= drop
+        return p
+
+    ch_pos["FTT9h"]  = _mid_inferior("FT7", "T7")
+    ch_pos["FTT10h"] = _mid_inferior("FT8", "T8")
+    ch_pos["TPP9h"]  = _mid_inferior("TP7", "P7")
+    ch_pos["TPP10h"] = _mid_inferior("TP8", "P8")
+
+    return mne.channels.make_dig_montage(ch_pos=ch_pos, coord_frame="head")
 
 def _reref_ieeg_ch(inst, reref_ch):
     """

@@ -1,7 +1,8 @@
-import mne 
+import mne
 import numpy as np
 from matplotlib import pyplot as plt
-import datetime
+
+from neuromotion.io import assert_iso_synced
 
 def annot_gait_lean(                                                                          
     raw_motion,                                                                               
@@ -236,25 +237,26 @@ def annot_gait_cycles(
     cycle_info : list of dict
         Per-epoch metadata.
     """
+    # Hard-require ISO wallclock alignment: start wallclock and duration
+    # must agree to tolerance. Under that invariant, the motion-frame
+    # annotation onset can be re-expressed in ieeg's meas_date frame by
+    # swapping the two raws' first_time anchors (this correctly handles the
+    # case where meas_date differs but absolute start wallclock matches).
+    # Downstream crop and cycle_info['onset'] then live in the ieeg
+    # meas_date frame and compare directly against raw_ieeg.annotations.
+    assert_iso_synced(raw_motion, raw_ieeg, labels=["raw_motion", "raw_ieeg"])
+
     sfreq_ieeg = float(raw_ieeg.info["sfreq"])
+    motion_first = raw_motion.first_time
+    ieeg_first = raw_ieeg.first_time
     left_desc = f"{annot_type}_left"
     right_desc = f"{annot_type}_right"
 
-    # Check synchronization
-    motion_first = raw_motion.first_time
-    motion_start_iso = raw_motion.info["meas_date"] + datetime.timedelta(seconds=motion_first)
-    ieeg_first = raw_ieeg.first_time
-    ieeg_start_iso = raw_ieeg.info["meas_date"] + datetime.timedelta(seconds=ieeg_first)
-    if abs(motion_start_iso - ieeg_start_iso) > datetime.timedelta(seconds=0.01):
-        print(f"Warning: raw_motion and raw_ieeg have different first_time "
-              f"({motion_first:.2f}s vs {ieeg_first:.2f}s). "
-              f"Check if they are properly aligned in time.")
-
-    # --- collect left and right segments in ieeg time ---
+    # --- collect left and right segments in ieeg meas_date wallclock ---
     left_segs = []
     right_segs = []
     for annot in raw_motion.annotations:
-        onset = annot["onset"] - motion_first + ieeg_first  # now ieeg_time
+        onset = annot["onset"] - motion_first + ieeg_first  # motion-frame -> ieeg-frame
         if annot["description"] == left_desc:
             left_segs.append((onset, annot["duration"]))
         elif annot["description"] == right_desc:
