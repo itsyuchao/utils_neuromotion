@@ -217,6 +217,7 @@ def annot_gait_cycles(
     annot_type="gait_lean",
     cycle_min_dur=0.6,
     cycle_max_dur=1.8,
+    max_gap_s=0.2,
     pad_s=0.5,
 )->tuple[list[mne.io.RawArray], list[dict]]:
     """
@@ -266,27 +267,28 @@ def annot_gait_cycles(
     right_segs.sort(key=lambda x: x[0])
 
     # --- pair left-right into cycles ---
-    used_right = set()
     cycles = []
+    ri = 0  # walking pointer into right_segs
 
     for l_on, l_dur in left_segs:
         l_end = l_on + l_dur
-        best_ri = None
-        best_gap = np.inf
-        for ri, (r_on, r_dur) in enumerate(right_segs):
-            if ri in used_right:
-                continue
-            gap = r_on - l_end
-            if -0.05 <= gap < best_gap:
-                best_gap = gap
-                best_ri = ri
-        if best_ri is None or best_gap > 0.1:
-            continue
-        used_right.add(best_ri)
-        r_on, r_dur = right_segs[best_ri]
-        cycle_dur = (r_on + r_dur) - l_on
-        if cycle_min_dur <= cycle_dur <= cycle_max_dur:
-            cycles.append((l_on, cycle_dur))
+
+        # advance pointer past any right segments that ended before this left
+        while ri < len(right_segs) and right_segs[ri][0] + right_segs[ri][1] <= l_on:
+            ri += 1
+
+        if ri >= len(right_segs):
+            break
+
+        r_on, r_dur = right_segs[ri]
+        gap = r_on - l_end
+
+        # must start within max_gap of left ending (allow slight overlap with -0.05)
+        if -0.05 <= gap <= max_gap_s:
+            cycle_dur = (r_on + r_dur) - l_on
+            if cycle_min_dur <= cycle_dur <= cycle_max_dur:
+                cycles.append((l_on, cycle_dur))
+            ri += 1  # consume this right segment regardless of cycle validity
 
     # --- epoch from raw_ieeg with padding ---
     epochs = []
