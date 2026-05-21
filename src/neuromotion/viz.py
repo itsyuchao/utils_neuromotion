@@ -180,70 +180,43 @@ def plot_tfr(power_data, times, freqs=None, ax=None, vmin=-5, vmax=5, cmap='jet'
             raise ValueError(f"power_data must be 2D or 3D, got {power_data.ndim}D")
 
         if freqs is None:
-            freqs = 2 ** np.arange(0,7,0.1)
-            freqs = freqs[freqs <= 90]  # Limit to 90 Hz due to amplifier settings
+            freqs = 2 ** np.arange(0, 7, 0.1)
+            freqs = freqs[freqs <= 90]
 
-        if y_scale == 'log2':
-            ymin = np.log2(freqs[0])
-            ymax = np.log2(freqs[-1])
-        elif y_scale == 'linear':
-            ymin = freqs[0]
-            ymax = freqs[-1]
+        y_coords = np.log2(freqs) if y_scale == 'log2' else freqs
 
-        # Smooth background (bilinear / gouraud, full opacity).
-        if y_scale == 'log2':
-            im = ax.imshow(
-                power_data,
-                origin='lower',
-                aspect='auto',
-                extent=[times[0], times[-1], ymin, ymax],
-                interpolation='bilinear',
-                vmin=vmin, vmax=vmax,
-                cmap=cmap,
-            )
-        elif y_scale == 'linear':
-            im = ax.pcolormesh(
-                times, freqs, power_data,
-                vmin=vmin, vmax=vmax,
-                cmap=cmap,
-                shading='gouraud',
-            )
+        im = ax.pcolormesh(
+            times, y_coords, power_data,
+            vmin=vmin, vmax=vmax,
+            cmap=cmap,
+            shading='gouraud',
+        )
 
-        # Significant-cluster outline: contour at the True/False boundary of
-        # sig_mask. Marching squares gives a smooth outline on top of the
-        # smooth background -- no opacity hack needed.
         if sig_mask is not None and sig_mask.any():
-            y_coords = np.log2(freqs) if y_scale == 'log2' else freqs
             ax.contour(times, y_coords, sig_mask.astype(float),
                        levels=[0.5], colors=contour_color,
                        linewidths=contour_lw)
-        
+
         if y_scale == 'log2':
             all_tick_freqs = np.array([1, 2, 4, 8, 16, 32, 64, 128])
             ytick_freqs = all_tick_freqs[(all_tick_freqs >= freqs[0]) & (all_tick_freqs <= freqs[-1])]
-            yticks = np.log2(ytick_freqs)
-            ax.set_yticks(yticks)
+            ax.set_yticks(np.log2(ytick_freqs))
             ax.set_yticklabels(ytick_freqs)
-        elif y_scale == 'linear':
-            # Set y-axis ticks for linear scale
+        else:
             ytick_freqs = np.arange(freqs[0], freqs[-1], 10)
             ax.set_yticks(ytick_freqs)
             ax.set_yticklabels(ytick_freqs)
-        
-        # Label axes
+
         ax.set_ylabel('frequency (Hz)')
         ax.set_xlabel('time (s)')
-        
-        # Add vertical line at time=0
         ax.axvline(x=0, color='w', linestyle='--')
 
-        # Add colorbar
         cbar = plt.colorbar(im, ax=ax)
         cbar.set_label('power (z)', rotation=270, labelpad=15)
 
-        # Add title if provided
         if title is not None:
             ax.set_title(title)
+
         return im
 
 def plot_psd_for_raws(raw_path_list, channel_picks=None,
@@ -753,9 +726,9 @@ def plot_path_overlay_gait_lean(
 
     from matplotlib.lines import Line2D
     ax.legend(handles=[
-        Line2D([0], [0], color=cmap_left,  lw=2, label=f"{annot_type}_left"),
-        Line2D([0], [0], color=cmap_right, lw=2, label=f"{annot_type}_right"),
-        Line2D([0], [0], color=color_reset, lw=2, label=f"{annot_type}_reset"),
+        Line2D([0], [0], color=cmap_left,  lw=2, label=f"left step"),
+        Line2D([0], [0], color=cmap_right, lw=2, label=f"right step"),
+        Line2D([0], [0], color=color_reset, lw=2, label=f"reset"),
     ], loc="best", fontsize=9)
 
     return ax
