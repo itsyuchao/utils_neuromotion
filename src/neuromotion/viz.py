@@ -9,14 +9,8 @@ from typing import Iterable, Optional
 import mne
 
 from neuromotion import annot
-from neuromotion.io import pick_or_reref
+from neuromotion.io import pick_or_reref, save_fig
 from neuromotion.calc import extract_band_power, apply_morlet, cycles_to_tfr_stack
-
-def save_fig(path: Path, fig=None):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    (fig or plt.gcf()).savefig(path, bbox_inches="tight", dpi=300)
-    logging.info("Saved: %s", path)
-    plt.close(fig or plt.gcf())
 
 def plot_mean_with_sem(x, y_matrix, color='blue', label=None, ax=None):
     """
@@ -688,13 +682,15 @@ def plot_path_overlay_gait_lean(
     sample_color = np.full(n_times, color_reset, dtype=object)
 
     for annot in raw_motion.annotations:
-        if annot["description"] not in color_map:
+        # Match on the base label; lr_step swings carry a "/steplen…" suffix.
+        label = annot["description"].split("/")[0]
+        if label not in color_map:
             continue
         i_start = int(round((annot["onset"] - raw_motion.first_time) * sfreq))
         i_end   = int(round((annot["onset"] + annot["duration"] - raw_motion.first_time) * sfreq))
         i_start = max(0, i_start)
         i_end = min(n_times, i_end)
-        sample_color[i_start:i_end] = color_map[annot["description"]]
+        sample_color[i_start:i_end] = color_map[label]
 
     # optional binning
     if window_s is not None:

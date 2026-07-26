@@ -2,7 +2,10 @@ from __future__ import annotations
 import numpy as np
 import mne
 
-from neuromotion.io import pick_or_reref
+from pathlib import Path
+from neuromotion.io import pick_or_reref, save_fig
+from scipy.signal import find_peaks
+import matplotlib.pyplot as plt
 
 def calc_speed(data, diff_step=1, smoothing=10):
     """
@@ -543,3 +546,135 @@ def baseline_correct(data, baseline=None, rescale='zscore', axis=-1):
         return data - baseline_mean
     return data
 
+
+def filter_artifact(raw, window=(-0.5, 1.5), discover_advance_s=34, filter_advance_s=0,
+                    ch=(1, 2), sd_thresh=5, fig_path=None, fig_suffix=""):
+    """
+    Remove stereotyped magnet artifacts from a Percept run by template
+    subtraction, per channel index in `ch`:
+      1. Discover: onsets = samples crossing below -sd_thresh*SD; gather
+         `window` (s)-aligned segments, advancing `discover_advance_s` after
+         each, and average them into a channel-specific artifact template.
+      2. Match: cross-correlate the run with its template, find_peaks above the
+         template energy floor, keep peaks >= `filter_advance_s` apart (0 keeps
+         every peak, e.g. closely spaced magnet triplets).
+      3. Subtract: least-squares (MLE) scale+offset fit of the template at each
+         peak; subtract the scaled artifact shape.
+    Saves ArtifactDiscover_ch-*/XCorrPeaks/ArtifactPrePost/FilteredTS QC figures
+    to '{fig_path}_desc-*_{fig_suffix}.png' when `fig_path` is given.
+    Returns the filtered raw (a copy).
+    """
+    raw = raw.copy()
+    sfreq = raw.info["sfreq"]
+    names = raw.ch_names
+    ch_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    pre_n, post_n = int(-window[0] * sfreq), int(window[1] * sfreq)
+    win_n = pre_n + post_n
+    seg_t = np.arange(-pre_n, post_n) / sfreq
+    t = np.arange(raw.n_times) / sfreq
+    adv_disc, adv_filt = int(discover_advance_s * sfreq), int(filter_advance_s * sfreq)
+
+    orig = raw._data.copy()
+    res = {}
+    for ch_i in ch:
+        x0 = orig[ch_i]
+
+        # 1. discover isolated artifacts -> channel template
+        thresh = -sd_thresh * x0.std()
+        segs, i = [], pre_n
+        while i < len(x0) - post_n:
+            if x0[i] < thresh:
+                segs.append(x0[i - pre_n:i + post_n])
+                i += adv_disc  # advance past this artifact before searching again
+            else:
+                i += 1
+        segs = np.array(segs)
+        template = segs.mean(axis=0)
+        template = template - template.mean()
+
+        # 2. match: xcorr peaks above energy floor, kept filter_advance_s apart
+        xc = np.correlate(x0 - x0.mean(), template, mode="same")
+        height = 0.5 * (template ** 2).sum()
+        peaks, _ = find_peaks(xc, height=height)
+        kept, last = [], -adv_filt - 1
+        for p in peaks:
+            if p - last >= adv_filt:
+                kept.append(p)
+                last = p
+
+        # 3. MLE scale+offset fit, subtract the scaled artifact shape
+        A = np.vstack([template, np.ones_like(template)]).T
+        xf = raw._data[ch_i]
+        pre_rows, post_rows = [], []
+        for p in kept:
+            s = p - win_n // 2  # data window aligned with the centered template
+            if s < 0 or s + win_n > len(xf):
+                continue
+            seg = xf[s:s + win_n].copy()
+            (a, _b), *_ = np.linalg.lstsq(A, seg, rcond=None)
+            post = seg - a * template
+            xf[s:s + win_n] = post
+            pre_rows.append(seg)
+            post_rows.append(post)
+        print(f"{names[ch_i]}: {len(segs)} discovered, {len(post_rows)} subtracted.")
+        res[ch_i] = dict(segs=segs, xc=xc, height=height, peaks=np.array(peaks),
+                         kept=np.array(kept), pre=np.array(pre_rows), post=np.array(post_rows))
+
+    if fig_path is None:
+        return raw
+
+    def _save(desc, fig):
+        tag = f"_{fig_suffix}" if fig_suffix else ""
+        save_fig(Path(f"{fig_path}_desc-{desc}{tag}.png"), fig=fig)
+
+    def _band(ax, rows, color, label):  # individual traces + mean +/- sem
+        for r in rows:
+            ax.plot(seg_t, r, color=color, alpha=0.2, linewidth=0.2)
+        m = rows.mean(axis=0)
+        sem = rows.std(axis=0, ddof=1) / np.sqrt(len(rows))
+        ax.plot(seg_t, m, color=color, linewidth=1.5, label=f"{label} (n={len(rows)})")
+        ax.fill_between(seg_t, m - sem, m + sem, color=color, alpha=0.3)
+
+    # ArtifactDiscover: segments used to build each channel template
+    fig, axes = plt.subplots(1, len(ch), figsize=(6 * len(ch), 5), sharex=True)
+    for ax, ch_i in zip(np.atleast_1d(axes), ch):
+        _band(ax, res[ch_i]["segs"], ch_colors[ch_i], "discovered")
+        ax.axvline(0, color="k", linewidth=0.5, linestyle="--")
+        ax.set_title(names[ch_i]); ax.set_xlabel("Time from onset (s)"); ax.legend(fontsize=8)
+    np.atleast_1d(axes)[0].set_ylabel("Amplitude")
+    _save("ArtifactDiscover", fig)
+
+    # XCorrPeaks: find_peaks QC per channel xcorr
+    fig, axes = plt.subplots(len(ch), 1, figsize=(14, 4 * len(ch)), sharex=True)
+    for ax, ch_i in zip(np.atleast_1d(axes), ch):
+        r = res[ch_i]
+        ax.plot(t, r["xc"], color=ch_colors[ch_i], linewidth=0.5)
+        ax.axhline(r["height"], color="k", linewidth=0.8, linestyle="--", label="height thresh")
+        ax.plot(t[r["peaks"]], r["xc"][r["peaks"]], "x", color="gray", markersize=5,
+                label=f"find_peaks ({len(r['peaks'])})")
+        ax.plot(t[r["kept"]], r["xc"][r["kept"]], "o", mfc="none", mec="red", markersize=8,
+                label=f"kept ({len(r['kept'])})")
+        ax.set_title(names[ch_i]); ax.set_ylabel("Cross-corr"); ax.legend(fontsize=8)
+    np.atleast_1d(axes)[-1].set_xlabel("Time (s)")
+    _save("XCorrPeaks", fig)
+
+    # ArtifactPrePost: fitted windows before/after subtraction
+    fig, axes = plt.subplots(1, len(ch), figsize=(6 * len(ch), 5), sharex=True)
+    for ax, ch_i in zip(np.atleast_1d(axes), ch):
+        _band(ax, res[ch_i]["pre"], "gray", "pre")
+        _band(ax, res[ch_i]["post"], ch_colors[ch_i], "post")
+        ax.axvline(0, color="k", linewidth=0.5, linestyle="--")
+        ax.set_title(names[ch_i]); ax.set_xlabel("Time from onset (s)"); ax.legend(fontsize=8)
+    np.atleast_1d(axes)[0].set_ylabel("Amplitude")
+    _save("ArtifactPrePost", fig)
+
+    # FilteredTS: full-run original vs filtered for inspection
+    fig, axes = plt.subplots(len(ch), 1, figsize=(14, 4 * len(ch)), sharex=True)
+    for ax, ch_i in zip(np.atleast_1d(axes), ch):
+        ax.plot(t, orig[ch_i], color="gray", linewidth=0.5, label="original")
+        ax.plot(t, raw._data[ch_i], color=ch_colors[ch_i], linewidth=0.5, label="filtered")
+        ax.set_title(names[ch_i]); ax.set_ylabel("Amplitude"); ax.legend(fontsize=8)
+    np.atleast_1d(axes)[-1].set_xlabel("Time (s)")
+    _save("FilteredTS", fig)
+
+    return raw

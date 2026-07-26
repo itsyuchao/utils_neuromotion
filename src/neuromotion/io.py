@@ -1,8 +1,18 @@
 from __future__ import annotations
 import datetime
+import logging
 import numpy as np
 import warnings
 import mne
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+
+def save_fig(path: Path, fig=None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    (fig or plt.gcf()).savefig(path, bbox_inches="tight", dpi=300)
+    logging.info("Saved: %s", path)
+    plt.close(fig or plt.gcf())
 
 
 def assert_iso_synced(*raws, tolerance_s: float = 0.01, labels=None) -> None:
@@ -63,6 +73,59 @@ def assert_iso_synced(*raws, tolerance_s: float = 0.01, labels=None) -> None:
                 f"({dd:.4f}s > {tolerance_s}s): "
                 f"{labels[0]}={d0:.3f}s vs {lbl}={d:.3f}s"
             )
+
+
+def assert_iso_overlap(*raws, labels=None) -> None:
+    """Verify that all raws overlap in absolute ISO wallclock time.
+
+    Relaxed companion to :func:`assert_iso_synced`: instead of requiring
+    identical start wallclock and duration, this only requires that the
+    recordings' wallclock windows ``[meas_date + first_time, meas_date +
+    first_time + duration]`` mutually overlap. Use it when segmenting one raw
+    by another raw's annotations where the two are separate runs sharing only
+    a common time span (e.g. an iEEG run and a motion run recorded in the same
+    session). ``meas_date`` is authoritative for cross-raw conversion, so it
+    must be set on every input.
+
+    Parameters
+    ----------
+    *raws : mne.io.BaseRaw
+        Two or more raws expected to overlap in ISO wallclock time.
+    labels : list[str] | None
+        Human-readable labels for error messages.
+
+    Raises
+    ------
+    ValueError
+        If ``meas_date`` is missing on any raw, or the wallclock windows do
+        not all mutually overlap.
+    """
+    if len(raws) < 2:
+        return
+    labels = list(labels) if labels else [f"raw{i}" for i in range(len(raws))]
+    if len(labels) != len(raws):
+        raise ValueError("labels length must match number of raws")
+
+    starts, ends = [], []
+    for r, lbl in zip(raws, labels):
+        md = r.info["meas_date"]
+        if md is None:
+            raise ValueError(
+                f"{lbl}.info['meas_date'] is None -- cannot verify ISO overlap. "
+                f"Run the sync step that sets meas_date before chunking across raws."
+            )
+        start = md + datetime.timedelta(seconds=r.first_time)
+        starts.append(start)
+        ends.append(start + datetime.timedelta(seconds=r.times[-1]))
+
+    latest_start = max(starts)
+    earliest_end = min(ends)
+    if latest_start > earliest_end:
+        desc = ", ".join(
+            f"{lbl}=[{s.isoformat()}, {e.isoformat()}]"
+            for lbl, s, e in zip(labels, starts, ends)
+        )
+        raise ValueError(f"raws do not overlap in ISO wallclock time: {desc}")
 
 
 def antneuro_ucla_63ch() -> mne.channels.DigMontage:

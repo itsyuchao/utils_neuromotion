@@ -2,7 +2,7 @@ import mne
 import numpy as np
 from matplotlib import pyplot as plt
 
-from neuromotion.io import assert_iso_synced
+from neuromotion.io import assert_iso_synced, assert_iso_overlap
 
 def annot_gait_lean(                                                                          
     raw_motion,                                                                               
@@ -173,8 +173,27 @@ def annot_lr_step(
     # both moving / both still → 0 → lr_step_reset
 
     # ── contiguous runs → annotations ──
+    # Left/right swing annotations additionally carry that swing's step LENGTH
+    # as a "/steplen{m}" description field (same "/"-separated scheme as the cue
+    # annotations): the net Euclidean (x,z) displacement of the swinging foot
+    # (LFoot for left, RFoot for right) between the window's first and last
+    # sample. Motive raw exports are in mm, so divide by 1000 to log meters,
+    # rounded to 3 dp. Reset (double support) has no swinging foot and stays a
+    # bare "lr_step_reset".
     labels = {-1: "lr_step_left", 0: "lr_step_reset", 1: "lr_step_right"}
     min_samp = max(1, int(round(min_event_duration_s * sfreq)))
+
+    def _make_desc(val, start, length):
+        if val == -1:
+            foot = lfoot
+        elif val == 1:
+            foot = rfoot
+        else:
+            return labels[val]   # reset: no swinging foot, no step length
+        p0 = foot[:, start]
+        p1 = foot[:, start + length - 1]
+        step_len_m = float(np.hypot(p1[0] - p0[0], p1[1] - p0[1])) / 1000.0
+        return f"{labels[val]}/steplen{step_len_m:.3f}"
 
     onsets, durations, descriptions = [], [], []
     run_start = 0
@@ -188,7 +207,7 @@ def annot_lr_step(
             if run_len >= min_samp:
                 onsets.append(run_start / sfreq)
                 durations.append(run_len / sfreq)
-                descriptions.append(labels[run_val])
+                descriptions.append(_make_desc(run_val, run_start, run_len))
             run_start = i
             run_val = state[i]
 
@@ -199,10 +218,13 @@ def annot_lr_step(
         orig_time=raw_motion.info["meas_date"],
     )
 
-    # ── merge: replace any existing lr_step_* annotations ──
+    # ── merge: replace any existing lr_step_* annotations. Match on the base
+    # label (before any "/steplen…" field) so prior runs are cleaned regardless
+    # of the step length each logged. ──
+    base_labels = set(labels.values())
     if raw_motion.annotations is not None and len(raw_motion.annotations):
-        replace_desc = set(step_annot.description)
-        keep_mask = [d not in replace_desc for d in raw_motion.annotations.description]
+        keep_mask = [d.split("/")[0] not in base_labels
+                     for d in raw_motion.annotations.description]
         kept_annots = raw_motion.annotations[keep_mask]
         raw_motion.set_annotations(kept_annots + step_annot)
     else:
@@ -214,21 +236,42 @@ def annot_lr_step(
 def annot_gait_cycles(
     raw_motion,
     raw_ieeg,
-    annot_type="gait_lean",
+    annot_type="lr_step",
     cycle_min_dur=0.6,
     cycle_max_dur=1.8,
-    max_gap_s=0.2,
     pad_s=0.5,
 )->tuple[list[mne.io.RawArray], list[dict]]:
     """
-    Extract iEEG epochs aligned to valid gait cycles (left-right pairs)
-    from {annot_type}_left / {annot_type}_right annotations on raw_motion.
+    Extract iEEG epochs aligned to valid gait cycles from
+    {annot_type}_left / {annot_type}_right annotations on raw_motion.
+
+    A cycle spans one full stride: it starts at a left swing, includes the
+    following right swing, and ends at the onset of the NEXT left swing. The
+    cycle duration is that left-onset -> next-left-onset gap, and a cycle is
+    accepted only when cycle_min_dur <= duration <= cycle_max_dur (so a stop,
+    which stretches the gap past cycle_max_dur, is rejected without any
+    separate gap parameter). Any {annot_type}_reset (double-support)
+    annotations are ignored entirely; only the left/right swing onsets define
+    the cycle. The same left -> right -> next-left walk applies to every
+    annot_type (e.g. "lr_step", "gait_lean").
+
+    raw_motion and raw_ieeg need only OVERLAP in ISO wallclock time; they are
+    separate runs that share neither start wallclock nor duration (relaxed
+    from the previous exact-ISO-sync requirement). ``meas_date`` is the
+    authoritative timestamp: motion-frame annotation onsets are re-expressed in
+    the ieeg meas_date frame via the two raws' ``meas_date`` difference, and
+    only cycles whose padded window falls inside raw_ieeg are kept — so the
+    overlapping span alone yields epochs.
 
     Parameters
     ----------
     annot_type : str
         Prefix of the left/right annotations to consume. Use "gait_lean"
         for output of annot_gait_lean, "lr_step" for annot_lr_step.
+    ensure_annot : bool
+        If True and annot_type == "lr_step", generate the lr_step_left/right
+        annotations on raw_motion (via annot_lr_step) when they are missing,
+        so a motion fif loaded straight from disk can be segmented directly.
 
     Returns
     -------
@@ -236,65 +279,112 @@ def annot_gait_cycles(
         Each element is a short Raw segment (n_channels, n_samples)
         with pad_s pre and post, preserving channel info for pick_channels/get_data.
     cycle_info : list of dict
-        Per-epoch metadata.
+        Per-epoch metadata. In addition to the timing/pad-index fields, each
+        cycle carries per-side step metrics read straight off the swing
+        annotations: ``left_step_dur_s`` / ``right_step_dur_s`` (the left/right
+        swing window lengths) and ``left_step_length_m`` / ``right_step_length_m``
+        (the step lengths logged by annot_lr_step in the "/steplen{m}"
+        description field; NaN for annot_type without that field, e.g.
+        "gait_lean").
     """
-    # Hard-require ISO wallclock alignment: start wallclock and duration
-    # must agree to tolerance. Under that invariant, the motion-frame
-    # annotation onset can be re-expressed in ieeg's meas_date frame by
-    # swapping the two raws' first_time anchors (this correctly handles the
-    # case where meas_date differs but absolute start wallclock matches).
-    # Downstream crop and cycle_info['onset'] then live in the ieeg
-    # meas_date frame and compare directly against raw_ieeg.annotations.
-    assert_iso_synced(raw_motion, raw_ieeg, labels=["raw_motion", "raw_ieeg"])
+    # Relaxed constraint: raw_motion and raw_ieeg only need to OVERLAP in ISO
+    # wallclock time (not share start + duration). meas_date is authoritative,
+    # so a motion-frame annotation onset (seconds since motion meas_date) is
+    # re-expressed in the ieeg meas_date frame by adding the meas_date
+    # difference. Downstream crop and cycle_info['onset'] then live in the
+    # ieeg meas_date frame and compare directly against raw_ieeg.annotations.
+    assert_iso_overlap(raw_motion, raw_ieeg, labels=["raw_motion", "raw_ieeg"])
 
     sfreq_ieeg = float(raw_ieeg.info["sfreq"])
-    motion_first = raw_motion.first_time
     ieeg_first = raw_ieeg.first_time
     left_desc = f"{annot_type}_left"
     right_desc = f"{annot_type}_right"
 
-    # --- collect left and right segments in ieeg meas_date wallclock ---
-    left_segs = []
-    right_segs = []
+    # Shift from the motion meas_date frame to the ieeg meas_date frame. Both
+    # onsets are seconds-since-respective-meas_date; under exact ISO sync this
+    # equals the old (-motion_first + ieeg_first) anchor swap.
+    meas_delta_s = (raw_motion.info["meas_date"]
+                    - raw_ieeg.info["meas_date"]).total_seconds()
+
+    def _step_len_m(desc):
+        # Step length logged by annot_lr_step in the "/steplen{m}" field, e.g.
+        # "lr_step_left/steplen0.523". NaN when absent (e.g. gait_lean).
+        for field in desc.split("/")[1:]:
+            if field.startswith("steplen"):
+                try:
+                    return float(field[len("steplen"):])
+                except ValueError:
+                    return np.nan
+        return np.nan
+
+    # --- collect the left/right swing segments in time order (ieeg meas_date
+    # frame), tagged L / R and carrying the logged step length (m). Reset
+    # (double-support) annotations are ignored entirely: only swing onsets
+    # define a cycle. We walk this merged sequence to grab each cycle as a
+    # left swing -> following right swing -> next left swing.
+    segs = []   # (onset, duration, kind, step_length_m)
     for annot in raw_motion.annotations:
-        onset = annot["onset"] - motion_first + ieeg_first  # motion-frame -> ieeg-frame
-        if annot["description"] == left_desc:
-            left_segs.append((onset, annot["duration"]))
-        elif annot["description"] == right_desc:
-            right_segs.append((onset, annot["duration"]))
+        onset = annot["onset"] + meas_delta_s  # motion frame -> ieeg frame
+        label = annot["description"].split("/")[0]
+        if label == left_desc:
+            segs.append((onset, annot["duration"], "L", _step_len_m(annot["description"])))
+        elif label == right_desc:
+            segs.append((onset, annot["duration"], "R", _step_len_m(annot["description"])))
+    segs.sort(key=lambda s: s[0])
+    n_seg = len(segs)
 
-    left_segs.sort(key=lambda x: x[0])
-    right_segs.sort(key=lambda x: x[0])
-
-    # --- pair left-right into cycles ---
+    # --- walk left -> right -> next-left into cycles. The cycle duration is
+    # the onset gap between a left swing and the subsequent left swing (one
+    # full stride); the intervening right swing supplies the right-side step
+    # metrics. Resets are absent from segs, so only swing onsets are seen. ---
     cycles = []
-    ri = 0  # walking pointer into right_segs
+    i = 0
+    while i < n_seg:
+        if segs[i][2] != "L":
+            i += 1
+            continue
+        l_on, l_dur, _, l_len = segs[i]
 
-    for l_on, l_dur in left_segs:
-        l_end = l_on + l_dur
+        # scan forward to the next right swing; restart from a later left if
+        # one appears before any right.
+        j = i + 1
+        while j < n_seg and segs[j][2] != "R":
+            if segs[j][2] == "L":
+                break
+            j += 1
+        if j >= n_seg or segs[j][2] != "R":
+            i = j if (j < n_seg and segs[j][2] == "L") else i + 1
+            continue
 
-        # advance pointer past any right segments that ended before this left
-        while ri < len(right_segs) and right_segs[ri][0] + right_segs[ri][1] <= l_on:
-            ri += 1
+        _, r_dur, _, r_len = segs[j]
 
-        if ri >= len(right_segs):
-            break
+        # scan forward to the closing left swing (start of the next cycle);
+        # its onset minus this left's onset is the cycle duration.
+        k = j + 1
+        while k < n_seg and segs[k][2] != "L":
+            k += 1
+        if k >= n_seg:
+            break   # no closing left swing; the final cycle cannot be formed
 
-        r_on, r_dur = right_segs[ri]
-        gap = r_on - l_end
-
-        # must start within max_gap of left ending (allow slight overlap with -0.05)
-        if -0.05 <= gap <= max_gap_s:
-            cycle_dur = (r_on + r_dur) - l_on
-            if cycle_min_dur <= cycle_dur <= cycle_max_dur:
-                cycles.append((l_on, cycle_dur))
-            ri += 1  # consume this right segment regardless of cycle validity
+        cycle_dur = segs[k][0] - l_on      # left onset -> next left onset
+        if cycle_min_dur <= cycle_dur <= cycle_max_dur:
+            cycles.append({
+                "onset": l_on,
+                "duration": cycle_dur,
+                "left_step_dur_s": l_dur,
+                "right_step_dur_s": r_dur,
+                "left_step_length_m": l_len,
+                "right_step_length_m": r_len,
+            })
+        # the closing left swing begins the next cycle
+        i = k
 
     # --- epoch from raw_ieeg with padding ---
     epochs = []
     cycle_info = []
 
-    for onset, dur in cycles:
+    for cyc in cycles:
+        onset, dur = cyc["onset"], cyc["duration"]
         t_start = onset - ieeg_first - pad_s
         t_end = onset - ieeg_first + dur + pad_s
 
@@ -314,6 +404,10 @@ def annot_gait_cycles(
             "cycle_start_idx": pad_samp,
             "cycle_end_idx": pad_samp + cycle_samp,
             "n_samples": epoch_raw.n_times,
+            "left_step_dur_s": cyc["left_step_dur_s"],
+            "right_step_dur_s": cyc["right_step_dur_s"],
+            "left_step_length_m": cyc["left_step_length_m"],
+            "right_step_length_m": cyc["right_step_length_m"],
         })
 
     print(f"Extracted {len(epochs)} valid gait cycles from '{annot_type}' "
