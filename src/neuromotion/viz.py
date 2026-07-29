@@ -715,8 +715,8 @@ def plot_path_overlay_gait_lean(
     lc = LineCollection(segs, colors=seg_colors, linewidths=2, alpha=alpha)
     ax.add_collection(lc)
     ax.autoscale()
-    ax.set_xlabel(f"{motion_xy[0]} (m)")
-    ax.set_ylabel(f"{motion_xy[1]} (m)")
+    ax.set_xlabel(f"left-right (m)")
+    ax.set_ylabel(f"front-back (m)")
     if subplot_title is not None:
         ax.set_title(subplot_title)
 
