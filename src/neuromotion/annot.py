@@ -280,12 +280,19 @@ def annot_gait_cycles(
         with pad_s pre and post, preserving channel info for pick_channels/get_data.
     cycle_info : list of dict
         Per-epoch metadata. In addition to the timing/pad-index fields, each
-        cycle carries per-side step metrics read straight off the swing
-        annotations: ``left_step_dur_s`` / ``right_step_dur_s`` (the left/right
-        swing window lengths) and ``left_step_length_m`` / ``right_step_length_m``
-        (the step lengths logged by annot_lr_step in the "/steplen{m}"
-        description field; NaN for annot_type without that field, e.g.
-        "gait_lean").
+        cycle carries ``cycle_mid_idx``: the sample index (within the padded
+        epoch, same frame as ``cycle_start_idx`` / ``cycle_end_idx``) of the
+        RIGHT swing onset ({annot_type}_right, so it works for both "lr_step"
+        and "gait_lean"). The exact right-step onset time is otherwise lost
+        after extraction; downstream normalized-time interpolation
+        (``cycles_to_bandpower_matrix`` / ``cycles_to_tfr_stack``) uses it to
+        anchor the right-step onset at sample n_interp//2, interpolating each
+        half-cycle independently. Each cycle also carries per-side step
+        metrics read straight off the swing annotations: ``left_step_dur_s``
+        / ``right_step_dur_s`` (the left/right swing window lengths) and
+        ``left_step_length_m`` / ``right_step_length_m`` (the step lengths
+        logged by annot_lr_step in the "/steplen{m}" description field; NaN
+        for annot_type without that field, e.g. "gait_lean").
     """
     # Relaxed constraint: raw_motion and raw_ieeg only need to OVERLAP in ISO
     # wallclock time (not share start + duration). meas_date is authoritative,
@@ -356,7 +363,7 @@ def annot_gait_cycles(
             i = j if (j < n_seg and segs[j][2] == "L") else i + 1
             continue
 
-        _, r_dur, _, r_len = segs[j]
+        r_on, r_dur, _, r_len = segs[j]
 
         # scan forward to the closing left swing (start of the next cycle);
         # its onset minus this left's onset is the cycle duration.
@@ -371,6 +378,7 @@ def annot_gait_cycles(
             cycles.append({
                 "onset": l_on,
                 "duration": cycle_dur,
+                "right_onset": r_on,
                 "left_step_dur_s": l_dur,
                 "right_step_dur_s": r_dur,
                 "left_step_length_m": l_len,
@@ -402,6 +410,8 @@ def annot_gait_cycles(
             "pad_s": pad_s,
             "sfreq": sfreq_ieeg,
             "cycle_start_idx": pad_samp,
+            "cycle_mid_idx": pad_samp + int(round((cyc["right_onset"] - onset)
+                                                    * sfreq_ieeg)),
             "cycle_end_idx": pad_samp + cycle_samp,
             "n_samples": epoch_raw.n_times,
             "left_step_dur_s": cyc["left_step_dur_s"],

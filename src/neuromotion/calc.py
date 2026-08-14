@@ -1,5 +1,6 @@
 from __future__ import annotations
 import numpy as np
+import pandas as pd
 import mne
 
 from pathlib import Path
@@ -34,7 +35,39 @@ def calc_speed(data, diff_step=1, smoothing=10):
     derivatives = np.convolve(derivatives, np.ones(smoothing)/smoothing, mode='same')
     return derivatives
 
-def calc_path_directions(data, smoothing=10):  
+def calc_speed_from_raw(raw_motion, motion_xy=("pos_z", "pos_x"), speed_smooth_s=0.2):
+    """
+    Compute walking speed (m/s) from two position channels on an mne Raw.
+
+    Position channels are read in mm and converted to meters; speed is the
+    magnitude of the numerical derivative (np.gradient at the raw's sfreq),
+    optionally smoothed with a moving-average of length speed_smooth_s (s).
+
+    Returns
+    -------
+    x, y : np.ndarray, shape (n_times,) -- positions in meters
+    speed : np.ndarray, shape (n_times,) -- speed in m/s
+    """
+    sfreq = float(raw_motion.info["sfreq"])
+    picks = mne.pick_channels(raw_motion.ch_names, include=list(motion_xy))
+    if len(picks) != 2:
+        raise ValueError(f"Missing channels {motion_xy} in raw_motion.ch_names")
+
+    data = raw_motion.get_data(picks=picks)  # (2, n_time) in mm
+    x, y = data[0] / 1000.0, data[1] / 1000.0
+
+    dt = 1.0 / sfreq
+    dx, dy = np.gradient(x, dt), np.gradient(y, dt)
+    speed = np.sqrt(dx**2 + dy**2)
+
+    if speed_smooth_s and speed_smooth_s > 0:
+        win = max(1, int(round(speed_smooth_s * sfreq)))
+        speed = np.convolve(speed, np.ones(win) / win, mode="same")
+
+    return x, y, speed
+
+
+def calc_path_directions(data, smoothing=10):
     """
     Compute the direction of the path in radians using displacement in x and y directions.
     Handles cases where movement is predominantly in a straight line.
@@ -82,7 +115,145 @@ def interp_vector(column_vector, frames=250):
     resampled_vector = np.interp(target_indices, original_indices, column_vector)
     return resampled_vector
 
-def calc_step_length(pelvis, l_foot, r_foot, smoothing=1): 
+def trial_speed_matrix(raw_motion, windows, duration_s, motion_xy=("pos_z", "pos_x"),
+                       speed_smooth_s=0.2, window_s=0.1):
+    """
+    Stack per-window speed traces from one raw into an (n_windows, n_bins)
+    matrix. Each row is resampled (via interp_vector) onto a common axis
+    spanning [0, duration_s], so windows of slightly different recorded
+    length (timing jitter) still align to the same nominal time axis.
+
+    Parameters
+    ----------
+    windows : list of (tmin, tmax)
+        Same time base as raw_motion.annotations onset (i.e. relative to
+        raw_motion.first_time).
+    duration_s : float
+        Nominal window duration (s) shared by every row's time axis.
+    window_s : float
+        Bin width (s) of the shared time axis; n_bins = round(duration_s / window_s).
+
+    Returns
+    -------
+    mat : np.ndarray, shape (len(windows), n_bins)
+    """
+    sfreq = float(raw_motion.info["sfreq"])
+    _, _, speed = calc_speed_from_raw(raw_motion, motion_xy=motion_xy, speed_smooth_s=speed_smooth_s)
+    n_bins = round(duration_s / window_s)
+
+    rows = []
+    for tmin, tmax in windows:
+        i0 = round((tmin - raw_motion.first_time) * sfreq)
+        i1 = round((tmax - raw_motion.first_time) * sfreq)
+        rows.append(interp_vector(speed[i0:i1], frames=n_bins))
+    return np.array(rows)
+
+
+def cycle_info_to_df(cycle_info):
+    """Tidy per-cycle DataFrame from annot_gait_cycles' cycle_info list (one
+    dict per gait cycle) -- one row per cycle with cycle_onset_s / cycle_dur_s
+    (the left swing's onset/full-stride duration) and right_onset_s (the
+    right swing's own onset, reconstructed from cycle_mid_idx --
+    cycle_start_idx converted back to seconds), all raw-relative on the same
+    time base as raw_motion.annotations onset. Also carries the per-side step
+    metrics annot_gait_cycles reads off the swing annotations:
+    left_step_dur_s / right_step_dur_s and left_step_length_m /
+    right_step_length_m. Positional 1:1 with cycle_info (and so with the
+    epochs list annot_gait_cycles returns alongside it) -- callers needing
+    cue tags or other per-cycle metadata concat their own columns alongside
+    this frame rather than this function reaching into raw.annotations
+    itself, keeping it decoupled from any particular annotation schema."""
+    return pd.DataFrame({
+        "cycle_onset_s":       [c["onset"]              for c in cycle_info],
+        "cycle_dur_s":         [c["duration"]            for c in cycle_info],
+        "right_onset_s":       [c["onset"] + (c["cycle_mid_idx"] - c["cycle_start_idx"]) / c["sfreq"]
+                                                          for c in cycle_info],
+        "left_step_dur_s":     [c["left_step_dur_s"]     for c in cycle_info],
+        "right_step_dur_s":    [c["right_step_dur_s"]    for c in cycle_info],
+        "left_step_length_m":  [c["left_step_length_m"]  for c in cycle_info],
+        "right_step_length_m": [c["right_step_length_m"] for c in cycle_info],
+    })
+
+
+def trial_cycle_matrix(cycle_onsets_s, cycle_values, windows, duration_s,
+                       cycle_durs_s=None, window_s=0.1, agg="mean"):
+    """
+    Bin sparse per-cycle scalar values (e.g. step length, step duration, an
+    asymmetry index) onto a common nominal per-trial time axis -- the
+    per-cycle-event analog of trial_speed_matrix's continuous-signal
+    resampling.
+
+    Each row is one window (tmin, tmax). By default (cycle_durs_s=None) a
+    cycle whose onset falls inside [tmin, tmax) is linearly rescaled onto
+    [0, duration_s) and dropped into that single nominal bin -- a point
+    event. Pass cycle_durs_s to instead paint every bin the cycle's own
+    [onset, onset + duration) interval overlaps (rescaled the same way) with
+    its value -- e.g. so a step's own swing duration renders as a wide mark
+    spanning the time it actually took, rather than a single-bin spike.
+    Bins with no contributing cycle are NaN (not 0 -- callers should render
+    NaN as a visually distinct "no data" color rather than a real low
+    value); bins with more than one contributing cycle are aggregated with
+    `agg`.
+
+    Parameters
+    ----------
+    cycle_onsets_s : array, shape (n_cycles,)
+        Cycle onsets on the same raw-relative time base as `windows` (e.g.
+        cycle_info_to_df's "cycle_onset_s" / "right_onset_s").
+    cycle_values : array, shape (n_cycles,)
+        Per-cycle scalar to bin, same length/order as cycle_onsets_s. Pass
+        two side-by-side (onset, value) arrays concatenated together (e.g.
+        left + right step length, each at its own side's onset) to pool
+        both into one row instead of keeping them in separate matrices.
+    windows : list of (tmin, tmax)
+        Same time base as raw_motion.annotations onset.
+    duration_s : float
+        Nominal window duration (s) shared by every row's time axis.
+    cycle_durs_s : array, shape (n_cycles,), optional
+        Per-cycle interval length (s), same length/order as
+        cycle_onsets_s; when given, paints the cycle's whole
+        [onset, onset + duration) span instead of a single point.
+    window_s : float
+        Bin width (s) of the shared time axis; n_bins = round(duration_s / window_s).
+    agg : "mean" | "median"
+        Aggregator applied when more than one cycle contributes to the same bin.
+
+    Returns
+    -------
+    mat : np.ndarray, shape (len(windows), n_bins)
+    """
+    cycle_onsets_s = np.asarray(cycle_onsets_s, dtype=float)
+    cycle_values   = np.asarray(cycle_values, dtype=float)
+    if cycle_durs_s is not None:
+        cycle_durs_s = np.asarray(cycle_durs_s, dtype=float)
+    n_bins = round(duration_s / window_s)
+    agg_fn = {"mean": np.nanmean, "median": np.nanmedian}[agg]
+
+    mat = np.full((len(windows), n_bins), np.nan)
+    for r, (tmin, tmax) in enumerate(windows):
+        span = tmax - tmin
+        in_win = (cycle_onsets_s >= tmin) & (cycle_onsets_s < tmax)
+        if not np.any(in_win):
+            continue
+        onsets = cycle_onsets_s[in_win]
+        vals   = cycle_values[in_win]
+        starts = np.clip(((onsets - tmin) / span * n_bins).astype(int), 0, n_bins - 1)
+        if cycle_durs_s is None:
+            ends = starts
+        else:
+            ends = np.clip((((onsets + cycle_durs_s[in_win]) - tmin) / span * n_bins).astype(int),
+                           0, n_bins - 1)
+
+        bin_hits = {}
+        for b0, b1, v in zip(starts, ends, vals):
+            for b in range(b0, b1 + 1):
+                bin_hits.setdefault(b, []).append(v)
+        for b, vs in bin_hits.items():
+            mat[r, b] = agg_fn(vs)
+    return mat
+
+
+def calc_step_length(pelvis, l_foot, r_foot, smoothing=1):
     """
     Compute the projection of foot positions onto the pelvis movement direction.
 
@@ -310,12 +481,43 @@ def extract_band_phase(signal, l_freq, h_freq, sfreq=250, method='morlet', n_job
 
     return band_phase # should be same dimension as input signal
 
+def interp_cycle(core, n_interp, mid=None):
+    """
+    Linearly interpolate a 1-D cycle core onto a length-``n_interp``
+    normalized axis.
+
+    With ``mid`` (a sample index into ``core``, i.e. cycle_info's
+    'cycle_mid_idx' re-expressed relative to 'cycle_start_idx' -- the
+    right-step onset from annot_gait_cycles), the two half-cycles are
+    interpolated INDEPENDENTLY: ``core[:mid+1]`` onto the first
+    ``n_interp//2`` output samples and ``core[mid:]`` onto the remaining
+    ``n_interp - n_interp//2``, so the mid sample lands exactly on output
+    sample ``n_interp//2`` in every cycle (left-step onset -> 0, right-step
+    onset -> 1/2, next left-step onset -> 1). With ``mid=None`` the whole
+    core is interpolated uniformly (e.g. annot_cue_cycles info, which has
+    no mid anchor).
+    """
+    if mid is None:
+        return np.interp(np.linspace(0, 1, n_interp),
+                         np.linspace(0, 1, len(core)), core)
+    mid = int(np.clip(mid, 1, len(core) - 2))   # keep both halves non-empty
+    half = n_interp // 2
+    # endpoint=False keeps the mid sample out of the first half, so it appears
+    # exactly once -- as the first sample of the second half, at index half.
+    first = np.interp(np.linspace(0, 1, half, endpoint=False),
+                      np.linspace(0, 1, mid + 1), core[:mid + 1])
+    second = np.interp(np.linspace(0, 1, n_interp - half),
+                       np.linspace(0, 1, len(core) - mid), core[mid:])
+    return np.concatenate([first, second])
+
+
 def cycles_to_bandpower_matrix(epochs, cycle_info, ch_name,
                                l_freq, h_freq,
                                n_interp=100,
                                rescale="zscore",
                                method="morlet",
-                               n_jobs=4):
+                               n_jobs=4,
+                               pbar=None):
     """
     Build a (n_interp, n_cycles) band-power matrix from cycle epoch segments.
 
@@ -328,7 +530,10 @@ def cycles_to_bandpower_matrix(epochs, cycle_info, ch_name,
         1) pick_or_reref(ep, ch_name)
         2) extract_band_power on the FULL padded segment
         3) crop pads with cycle_info[k]['cycle_start_idx':'cycle_end_idx']
-        4) np.interp the core onto a length-``n_interp`` axis
+        4) interp_cycle the core onto a length-``n_interp`` axis; when
+           cycle_info carries 'cycle_mid_idx' (right-step onset sample,
+           annot_gait_cycles) the two halves are interpolated independently
+           so that sample is anchored at n_interp//2 in every cycle
 
     Parameters
     ----------
@@ -346,13 +551,16 @@ def cycles_to_bandpower_matrix(epochs, cycle_info, ch_name,
         Passed to extract_band_power (e.g. 'zscore').
     method : str
         'morlet' or 'hilbert' -- passed through to extract_band_power.
+    pbar : object | None
+        Progress hook: any object with an ``update(n)`` method (e.g. a tqdm
+        bar, possibly shared across concurrent calls), advanced by 1 after
+        each cycle is computed.
 
     Returns
     -------
     mat : np.ndarray, shape (n_interp, n_cycles)
         Empty (n_interp, 0) if no cycles supplied.
     """
-    x_norm = np.linspace(0, 1, n_interp)
     traces = []
     for ep, ci in zip(epochs, cycle_info):
         ep_picked = pick_or_reref(ep, ch_name)
@@ -365,8 +573,12 @@ def cycles_to_bandpower_matrix(epochs, cycle_info, ch_name,
             power = power[np.newaxis, :]
         # mean across channels if multiple, then trim pads with explicit indices
         core = power.mean(axis=0)[ci["cycle_start_idx"]:ci["cycle_end_idx"]]
-        x_orig = np.linspace(0, 1, len(core))
-        traces.append(np.interp(x_norm, x_orig, core))
+        mid = ci.get("cycle_mid_idx")
+        traces.append(interp_cycle(
+            core, n_interp,
+            mid=None if mid is None else mid - ci["cycle_start_idx"]))
+        if pbar is not None:
+            pbar.update(1)
     if not traces:
         return np.empty((n_interp, 0))
     return np.array(traces).T  # (n_interp, n_cycles)
@@ -375,7 +587,7 @@ def cycles_to_bandpower_matrix(epochs, cycle_info, ch_name,
 def cycles_to_tfr_stack(epochs, cycle_info, ch_name=None,
                         freqs=None, n_interp=250,
                         rescale="zscore", baseline=None,
-                        n_jobs=4):
+                        n_jobs=4, pbar=None):
     """
     Build a (n_cycles, n_freqs, n_interp) Morlet-TFR stack from cycle epoch segments.
 
@@ -389,7 +601,10 @@ def cycles_to_tfr_stack(epochs, cycle_info, ch_name=None,
         2) apply_morlet on the FULL padded segment
         3) mean across channels -> (n_freqs, n_samples_padded)
         4) crop pads with cycle_info[k]['cycle_start_idx':'cycle_end_idx']
-        5) np.interp each freq row onto a length-``n_interp`` axis
+        5) interp_cycle each freq row onto a length-``n_interp`` axis; when
+           cycle_info carries 'cycle_mid_idx' (right-step onset sample,
+           annot_gait_cycles) the two halves are interpolated independently
+           so that sample is anchored at n_interp//2 in every cycle
 
     Parameters
     ----------
@@ -402,6 +617,10 @@ def cycles_to_tfr_stack(epochs, cycle_info, ch_name=None,
     n_interp : int
         Length of the normalized cycle axis.
     rescale, baseline : passed to apply_morlet.
+    pbar : object | None
+        Progress hook: any object with an ``update(n)`` method (e.g. a tqdm
+        bar, possibly shared across concurrent calls), advanced by 1 after
+        each cycle is computed.
 
     Returns
     -------
@@ -415,7 +634,6 @@ def cycles_to_tfr_stack(epochs, cycle_info, ch_name=None,
         freqs = freqs[freqs <= 90]
     freqs = np.asarray(freqs)
     n_freqs = len(freqs)
-    x_norm = np.linspace(0, 1, n_interp)
 
     stack = []
     for ep, ci in zip(epochs, cycle_info):
@@ -429,12 +647,14 @@ def cycles_to_tfr_stack(epochs, cycle_info, ch_name=None,
         tfr = tfr.squeeze(axis=0).mean(axis=0)
         # explicit pad trim using cycle_info indices
         tfr = tfr[:, ci["cycle_start_idx"]:ci["cycle_end_idx"]]
-        n_samp = tfr.shape[-1]
+        mid = ci.get("cycle_mid_idx")
+        mid_rel = None if mid is None else mid - ci["cycle_start_idx"]
         tfr_interp = np.zeros((n_freqs, n_interp))
-        x_orig = np.linspace(0, 1, n_samp)
         for fi in range(n_freqs):
-            tfr_interp[fi] = np.interp(x_norm, x_orig, tfr[fi])
+            tfr_interp[fi] = interp_cycle(tfr[fi], n_interp, mid=mid_rel)
         stack.append(tfr_interp)
+        if pbar is not None:
+            pbar.update(1)
 
     if not stack:
         return np.empty((0, n_freqs, n_interp)), freqs

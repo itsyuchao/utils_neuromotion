@@ -1,6 +1,6 @@
 
 from __future__ import annotations
-import logging 
+import logging
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
@@ -10,7 +10,8 @@ import mne
 
 from neuromotion import annot
 from neuromotion.io import pick_or_reref, save_fig
-from neuromotion.calc import extract_band_power, apply_morlet, cycles_to_tfr_stack
+from neuromotion.calc import (extract_band_power, apply_morlet, cycles_to_tfr_stack,
+                              calc_speed_from_raw, trial_speed_matrix)
 
 def plot_mean_with_sem(x, y_matrix, color='blue', label=None, ax=None):
     """
@@ -100,7 +101,7 @@ def plot_tfr(power_data, times, freqs=None, ax=None, vmin=-5, vmax=5, cmap='jet'
              y_scale='log2', title=None,
              cluster_alpha=0.05,
              contour_color='k', contour_lw=1.0,
-             cluster_kwargs=None):
+             cluster_kwargs=None, n_jobs=1):
         """
         Plot time-frequency representation data.
 
@@ -136,8 +137,10 @@ def plot_tfr(power_data, times, freqs=None, ax=None, vmin=-5, vmax=5, cmap='jet'
         cluster_kwargs : dict | None
             Extra kwargs forwarded to
             ``mne.stats.permutation_cluster_1samp_test``. Defaults to
-            ``dict(threshold=dict(start=0, step=0.2), tail=0, n_jobs=1,
+            ``dict(threshold=dict(start=0, step=0.2), tail=0, n_jobs=n_jobs,
                    out_type='mask', verbose=False)``.
+        n_jobs : int
+            Number of jobs for the cluster permutation test.
 
         Returns
         -------
@@ -154,7 +157,7 @@ def plot_tfr(power_data, times, freqs=None, ax=None, vmin=-5, vmax=5, cmap='jet'
             mean_data = obs_data.mean(axis=0)
             if obs_data.shape[0] >= 2:
                 from mne.stats import permutation_cluster_1samp_test
-                kw = dict(threshold=dict(start=0, step=0.2), tail=0, n_jobs=1,
+                kw = dict(threshold=dict(start=0, step=0.2), tail=0, n_jobs=n_jobs,
                           out_type='mask', verbose=False)
                 if cluster_kwargs:
                     kw.update(cluster_kwargs)
@@ -197,7 +200,7 @@ def plot_tfr(power_data, times, freqs=None, ax=None, vmin=-5, vmax=5, cmap='jet'
             ax.set_yticks(np.log2(ytick_freqs))
             ax.set_yticklabels(ytick_freqs)
         else:
-            ytick_freqs = np.arange(freqs[0], freqs[-1], 10)
+            ytick_freqs = np.concatenate(([freqs[0]], np.arange(20, freqs[-1], 20), [freqs[-1]]))
             ax.set_yticks(ytick_freqs)
             ax.set_yticklabels(ytick_freqs)
 
@@ -480,31 +483,7 @@ def plot_path_overlay_speed(
     - Optional binning into window_s means (like your bandpower plot style).
     """
     sfreq = float(raw_motion.info["sfreq"])
-
-    # picks
-    picks = mne.pick_channels(raw_motion.ch_names, include=list(motion_xy))
-    if len(picks) != 2:
-        raise ValueError(f"Missing channels {motion_xy} in raw_motion.ch_names")
-
-    data = raw_motion.get_data(picks=picks)  # (2, n_time) in mm
-    x_mm, y_mm = data[0], data[1]
-
-    # convert to meters
-    x = x_mm / 1000.0
-    y = y_mm / 1000.0
-
-    # --- speed (m/s) ---
-    dt = 1.0 / sfreq
-    dx = np.gradient(x, dt)
-    dy = np.gradient(y, dt)
-    speed = np.sqrt(dx**2 + dy**2)
-
-    # optional smoothing of speed
-    if speed_smooth_s and speed_smooth_s > 0:
-        win = int(round(speed_smooth_s * sfreq))
-        win = max(1, win)
-        kernel = np.ones(win) / win
-        speed = np.convolve(speed, kernel, mode="same")
+    x, y, speed = calc_speed_from_raw(raw_motion, motion_xy=motion_xy, speed_smooth_s=speed_smooth_s)
 
     # --- optional binning to match your previous style ---
     if window_s is not None:
