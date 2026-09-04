@@ -158,7 +158,7 @@ def _reref_ieeg_ch(inst, reref_ch):
     """
     Re-reference Percept iEEG channels to derive sequential bipolar montages.
 
-    The RNS device records three bipolar pairs per hemisphere from a 4-contact
+    The Percept device records three bipolar pairs per hemisphere from a 4-contact
     strip (contacts 0-3):
         ZERO_THREE  = V0 - V3
         ONE_THREE   = V1 - V3

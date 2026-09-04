@@ -33,7 +33,7 @@ def plot_mean_with_sem(x, y_matrix, color='blue', label=None, ax=None):
         ax = plt.gca()
 
     # Plot mean and shaded standard deviation with clean edges
-    ax.plot(x, y_mean, color=color, label=label, linewidth=2)
+    ax.plot(x, y_mean, color=color, label=label, linewidth=0.5)
     ax.fill_between(x, y_mean - y_std, y_mean + y_std, color=color, alpha=0.2, edgecolor=None)
     if label:
         ax.legend()

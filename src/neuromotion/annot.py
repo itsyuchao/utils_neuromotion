@@ -498,3 +498,96 @@ def annot_cue_cycles(
     print(f"Extracted {len(epochs)} cue cycles ({cycle_len_s:.3f}s each) "
           f"from {len(periods)} periods")
     return epochs, cycle_info
+
+
+def annot_event_epochs(
+    raw,
+    events,
+    tmin,
+    tmax,
+    pad_s=0.5,
+) -> tuple[list[mne.io.RawArray], list[dict]]:
+    """
+    Crop a fixed [tmin, tmax] window around each of a list of arbitrary
+    event onset times. Output format mirrors annot_gait_cycles /
+    annot_cue_cycles: a list of padded epoch segments and a list of
+    cycle_info dicts, ready for cycles_to_bandpower_matrix /
+    cycles_to_tfr_stack.
+
+    Unlike annot_cue_cycles (which subdivides a period into contiguous,
+    non-overlapping cycles), each event here gets its own window placed
+    directly at its own onset -- windows may overlap if events are closely
+    spaced. tmin/tmax need not straddle 0 symmetrically (e.g. tmin=-0.5,
+    tmax=1.0 for a peri-stimulus window).
+
+    IMPORTANT: as with annot_cue_cycles, the returned epochs are NOT
+    time-adjusted to the core window -- each spans
+    ``[onset + tmin - pad_s, onset + tmax + pad_s]`` so a downstream
+    Morlet/Hilbert transform sees the pads as buffer against edge
+    artifacts; cycle_info's cycle_start_idx / cycle_end_idx mark the
+    [tmin, tmax] core to trim AFTER that transform. No cycle_mid_idx is
+    set -- every window has the identical fixed [tmin, tmax] length, so
+    uniform interpolation (interp_cycle with mid=None) already lands each
+    event's own onset at the same normalized fraction
+    (-tmin / (tmax - tmin)) in every epoch.
+
+    Parameters
+    ----------
+    raw : mne.io.BaseRaw
+        Continuous recording to crop from.
+    events : iterable of (onset_s, tags)
+        onset_s : float
+            Absolute raw time (i.e. including raw.first_time) of the event
+            to center the window on -- same convention as annot_cue_cycles'
+            ``periods`` (e.g. straight from an annotation's ``onset``).
+        tags : dict
+            Arbitrary per-event metadata (e.g. {"modality": ..., "beat_type":
+            ...}) merged into that event's cycle_info dict.
+    tmin, tmax : float
+        Core window bounds (s) relative to each event's onset_s.
+    pad_s : float
+        Padding before tmin and after tmax. Should match what the caller
+        plans to trim via cycle_info['cycle_start_idx':'cycle_end_idx'].
+
+    Returns
+    -------
+    epochs : list of mne.io.RawArray
+        Padded segments (NOT time-adjusted -- pads are still present).
+    cycle_info : list of dict
+        Per-event metadata: 'sfreq', 'pad_s', 'duration', 'onset',
+        'cycle_start_idx', 'cycle_end_idx', 'n_samples', plus that event's
+        own tags (tag keys must not collide with the fields above).
+    """
+    sfreq = float(raw.info["sfreq"])
+    raw_ft = raw.first_time
+    pad_samp = int(round(pad_s * sfreq))
+    duration = tmax - tmin
+    events = list(events)
+    epochs, cycle_info = [], []
+
+    for onset_s, tags in events:
+        c0 = onset_s + tmin
+        c1 = onset_s + tmax
+        t_start = c0 - raw_ft - pad_s
+        t_end = c1 - raw_ft + pad_s
+        if t_start < 0 or t_end > raw.times[-1]:
+            continue
+
+        ep = raw.copy().crop(tmin=t_start, tmax=t_end, include_tmax=False)
+        n_samples = ep.n_times
+        info = {
+            "sfreq": sfreq,
+            "pad_s": pad_s,
+            "duration": duration,
+            "onset": c0,
+            "cycle_start_idx": pad_samp,
+            "cycle_end_idx": n_samples - pad_samp,
+            "n_samples": n_samples,
+        }
+        info.update(tags)
+        cycle_info.append(info)
+        epochs.append(ep)
+
+    print(f"Extracted {len(epochs)} event epoch(s) ([{tmin}, {tmax}]s core, "
+          f"pad_s={pad_s}) from {len(events)} candidate event(s)")
+    return epochs, cycle_info
