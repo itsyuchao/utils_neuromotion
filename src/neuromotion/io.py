@@ -154,133 +154,129 @@ def antneuro_ucla_63ch() -> mne.channels.DigMontage:
 
     return mne.channels.make_dig_montage(ch_pos=ch_pos, coord_frame="head")
 
-def _reref_ieeg_ch(inst, reref_ch):
-    """
-    Re-reference Percept iEEG channels to derive sequential bipolar montages.
 
-    The Percept device records three bipolar pairs per hemisphere from a 4-contact
-    strip (contacts 0-3):
+def _reref_formula(reref_ch):
+    """Parse a sequential bipolar iEEG channel name into its source-contact
+    formula (pure string math, no data/inst involved).
+
+    The Percept device records three bipolar pairs per hemisphere from a
+    4-contact strip (contacts 0-3):
         ZERO_THREE  = V0 - V3
         ONE_THREE   = V1 - V3
         ZERO_TWO    = V0 - V2
-
-    This function derives the requested sequential bipolar channel:
-        ZERO_ONE    = ZERO_THREE - ONE_THREE       (V0 - V1)
+    From these, the sequential pairs are derived as:
+        ZERO_ONE    = ZERO_THREE - ONE_THREE             (V0 - V1)
         ONE_TWO     = ONE_THREE - ZERO_THREE + ZERO_TWO  (V1 - V2)
-        TWO_THREE   = ZERO_THREE - ZERO_TWO        (V2 - V3)
+        TWO_THREE   = ZERO_THREE - ZERO_TWO              (V2 - V3)
 
     Parameters
     ----------
-    inst : mne.io.Raw | mne.Epochs
-        MNE object whose channel names follow the pattern
-        ``{CONTACT}_{CONTACT}_{SIDE}`` (e.g. ``ZERO_THREE_LEFT``).
     reref_ch : str
-        Desired output channel, e.g. ``"ZERO_ONE_LEFT"``.
+        Desired output channel, e.g. ``"ZERO_ONE_LEFT"`` (CONTACT_CONTACT_SIDE).
         Valid contact pairs (order matters): ZERO_ONE, ONE_TWO, TWO_THREE.
-        Reversed pairs (e.g. ONE_ZERO) will raise a warning and return None.
 
     Returns
     -------
-    inst_out : mne.io.Raw | mne.Epochs
-        A copy containing only the single re-referenced channel, or None if
-        the requested pair is invalid.
+    list[(int, str)] | None
+        [(coeff, source_ch_name), ...] to sum, or None if reref_ch names a
+        reversed pair (e.g. ONE_ZERO) -- order matters for bipolar
+        re-referencing, so this warns and is skipped rather than an error.
     """
-    CONTACTS = ["ZERO", "ONE", "TWO", "THREE"]
-    VALID_PAIRS = {"ZERO_ONE", "ONE_TWO", "TWO_THREE"}
-    REVERSED_PAIRS = {"ONE_ZERO", "TWO_ONE", "THREE_TWO",
+    contacts = ("ZERO", "ONE", "TWO", "THREE")
+    valid_pairs = {"ZERO_ONE", "ONE_TWO", "TWO_THREE"}
+    reversed_pairs = {"ONE_ZERO", "TWO_ONE", "THREE_TWO",
                       "THREE_ZERO", "TWO_ZERO", "THREE_ONE"}
 
-    # ---- parse the requested channel string ----
     parts = reref_ch.upper().split("_")
-    if len(parts) != 3 or parts[0] not in CONTACTS or parts[1] not in CONTACTS:
+    if len(parts) != 3 or parts[0] not in contacts or parts[1] not in contacts:
         raise ValueError(
             f"reref_ch must be in the form CONTACT_CONTACT_SIDE "
             f"(e.g. ZERO_ONE_LEFT), got '{reref_ch}'"
         )
-    pair = f"{parts[0]}_{parts[1]}"
-    side = parts[2]  # e.g. "LEFT" or "RIGHT"
+    pair, side = f"{parts[0]}_{parts[1]}", parts[2]
 
-    if pair in REVERSED_PAIRS:
+    if pair in reversed_pairs:
         warnings.warn(
             f"Reversed pair '{pair}' requested — order matters for bipolar "
-            f"re-referencing. Valid sequential pairs are: {sorted(VALID_PAIRS)}. "
-            f"Returning None.",
+            f"re-referencing. Valid sequential pairs are: {sorted(valid_pairs)}. "
+            f"Skipping.",
             UserWarning,
-            stacklevel=2,
+            stacklevel=3,
         )
         return None
+    if pair not in valid_pairs:
+        raise ValueError(f"Unsupported pair '{pair}'. Valid pairs: {sorted(valid_pairs)}")
 
-    if pair not in VALID_PAIRS:
-        raise ValueError(
-            f"Unsupported pair '{pair}'. Valid pairs: {sorted(VALID_PAIRS)}"
-        )
-
-    # ---- build source channel names for this side ----
-    src = {
-        "ZERO_THREE": f"ZERO_THREE_{side}",
-        "ONE_THREE":  f"ONE_THREE_{side}",
-        "ZERO_TWO":   f"ZERO_TWO_{side}",
-    }
-
-    # ---- formulas: each maps target -> [(coeff, source_ch), ...] ----
+    zero_three, one_three, zero_two = (f"ZERO_THREE_{side}", f"ONE_THREE_{side}", f"ZERO_TWO_{side}")
     formulas = {
-        "ZERO_ONE":  [(1, src["ZERO_THREE"]), (-1, src["ONE_THREE"])],
-        "ONE_TWO":   [(1, src["ONE_THREE"]),  (-1, src["ZERO_THREE"]),
-                      (1, src["ZERO_TWO"])],
-        "TWO_THREE": [(1, src["ZERO_THREE"]), (-1, src["ZERO_TWO"])],
+        "ZERO_ONE":  [(1, zero_three), (-1, one_three)],
+        "ONE_TWO":   [(1, one_three), (-1, zero_three), (1, zero_two)],
+        "TWO_THREE": [(1, zero_three), (-1, zero_two)],
     }
-
-    formula = formulas[pair]
-
-    # ---- verify all required source channels exist ----
-    needed = [ch for _, ch in formula]
-    missing = [ch for ch in needed if ch not in inst.ch_names]
-    if missing:
-        raise ValueError(
-            f"Source channels {missing} not found in inst.ch_names: "
-            f"{inst.ch_names}"
-        )
-
-    # ---- compute the re-referenced data ----
-    inst_copy = inst.copy().pick(needed)
-    data = inst_copy.get_data()  # (n_channels, n_samples) or (n_epochs, n_channels, n_samples)
-    ch_idx = {ch: i for i, ch in enumerate(inst_copy.ch_names)}
-
-    if isinstance(inst, mne.io.BaseRaw):
-        result = sum(coeff * data[ch_idx[ch]] for coeff, ch in formula)
-        result = result[np.newaxis, :]  # (1, n_samples)
-        new_info = mne.create_info([reref_ch.upper()], inst.info["sfreq"],
-                                   ch_types="seeg")
-        return mne.io.RawArray(result, new_info)
-
-    elif isinstance(inst, mne.BaseEpochs):
-        result = sum(coeff * data[:, ch_idx[ch], :] for coeff, ch in formula)
-        result = result[:, np.newaxis, :]  # (n_epochs, 1, n_samples)
-        new_info = mne.create_info([reref_ch.upper()], inst.info["sfreq"],
-                                   ch_types="seeg")
-        return mne.EpochsArray(result, new_info, events=inst.events,
-                               tmin=inst.tmin, metadata=inst.metadata)
-    else:
-        raise TypeError(
-            f"inst must be mne.io.Raw or mne.Epochs, got {type(inst)}"
-        )
+    return formulas[pair]
 
 
 def pick_or_reref(inst: mne.io.BaseRaw | mne.BaseEpochs, ieeg_picks: list[str] | str):
-    """Pick channels from inst, re-referencing any that don't exist as-is."""
+    """Pick channels from inst, re-referencing any that don't exist as-is.
+
+    Works on inst.copy() throughout rather than building a fresh Raw/Epochs
+    for the derived channels: every derived channel's data is computed first
+    (while every original source channel is still untouched -- sequential
+    bipolar formulas reuse source contacts across targets, e.g. ONE_TWO needs
+    the same ZERO_THREE/ZERO_TWO contacts as TWO_THREE, so overwriting one
+    target's carrier channel before all formulas are evaluated would corrupt
+    a still-needed source), then each result is written in place over a
+    spare (not requested) source channel, which is renamed to the derived
+    channel's name. The returned object is that same copy of inst, so
+    meas_date, annotations/events, description, and everything else about
+    inst's metadata carry over automatically -- there's nothing to copy by
+    hand, and nothing to get out of sync.
+
+    Note: because derived channels are carved out of inst's own spare
+    channels rather than added fresh, a call can't request both a raw
+    source contact AND a derived channel built from it in the same
+    `ieeg_picks` if that leaves too few spare channels to hold every
+    derived channel -- this raises ValueError rather than silently
+    dropping one.
+    """
     picks_list = ieeg_picks if isinstance(ieeg_picks, list) else [ieeg_picks]
-    existing = [ch for ch in picks_list if ch in inst.ch_names]
-    to_reref = [ch for ch in picks_list if ch not in inst.ch_names]
-    parts = []
-    if existing:
-        parts.append(inst.copy().pick(existing))
-    for ch in to_reref:
-        rerefed = _reref_ieeg_ch(inst, ch)
-        if rerefed is not None:
-            parts.append(rerefed)
-    if not parts:
+    to_reref = {ch: _reref_formula(ch) for ch in picks_list if ch not in inst.ch_names}
+    to_reref = {ch: formula for ch, formula in to_reref.items() if formula is not None}
+
+    out = inst.copy()
+    out.load_data()
+
+    # Compute every derived channel's data up front, before any carrier
+    # channel is overwritten (see docstring).
+    computed = {}
+    for ch, formula in to_reref.items():
+        needed = [src_ch for _, src_ch in formula]
+        missing = [src_ch for src_ch in needed if src_ch not in out.ch_names]
+        if missing:
+            raise ValueError(f"Source channels {missing} not found in inst.ch_names: {out.ch_names}")
+        data = out.get_data(picks=needed)  # (n_channels, n_times) or (n_epochs, n_channels, n_times)
+        ch_idx = {src_ch: i for i, src_ch in enumerate(needed)}
+        if isinstance(out, mne.BaseEpochs):
+            computed[ch] = sum(coeff * data[:, ch_idx[src_ch], :] for coeff, src_ch in formula)
+        else:
+            computed[ch] = sum(coeff * data[ch_idx[src_ch]] for coeff, src_ch in formula)
+
+    carriers = [ch for ch in out.ch_names if ch not in picks_list]
+    if len(carriers) < len(computed):
+        raise ValueError(
+            f"pick_or_reref repurposes inst's own channels in place and can't add new "
+            f"ones: need {len(computed)} spare channel(s) for {list(computed)}, only "
+            f"{len(carriers)} available ({carriers})"
+        )
+
+    for carrier, (ch, data) in zip(carriers, computed.items()):
+        idx = out.ch_names.index(carrier)
+        if isinstance(out, mne.BaseEpochs):
+            out._data[:, idx, :] = data
+        else:
+            out._data[idx] = data
+        out.rename_channels({carrier: ch})
+
+    if not any(ch in out.ch_names for ch in picks_list):
         raise ValueError(f"No valid channels from {picks_list} in {inst.ch_names}")
-    inst = parts[0]
-    if len(parts) > 1:
-        inst.add_channels(parts[1:])
-    return inst
+    return out.pick([ch for ch in picks_list if ch in out.ch_names])
