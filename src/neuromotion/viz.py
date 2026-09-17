@@ -11,7 +11,7 @@ import mne
 from neuromotion import annot
 from neuromotion.io import pick_or_reref, save_fig
 from neuromotion.calc import (extract_band_power, apply_morlet, cycles_to_tfr_stack,
-                              calc_speed_from_raw, trial_speed_matrix)
+                              calc_speed_from_raw, trial_speed_matrix, project_ground_plane)
 
 def plot_mean_with_sem(x, y_matrix, color='blue', label=None, ax=None):
     """
@@ -706,6 +706,182 @@ def plot_path_overlay_gait_lean(
         Line2D([0], [0], color=color_reset, lw=2, label=f"reset"),
     ], loc="best", fontsize=9)
 
+    return ax
+
+
+def bone_color_map(trackers, cmap_left="Reds", cmap_right="Blues", cmap_other="Oranges",
+                    shade_range=(0.45, 0.9)):
+    """
+    One base RGBA per tracker: 'L*' trackers get shades of `cmap_left` (red
+    hue), 'R*' get shades of `cmap_right` (blue hue), everything else
+    (midline: Head/Neck/Chest/Ab/Hip) gets shades of `cmap_other` (orange
+    hue) -- side is readable at a glance by hue, individual trackers within a
+    side by shade (`shade_range` avoids each colormap's near-white end).
+
+    Parameters:
+        trackers (list[str]): tracker names, e.g. configs.FULLBODY_TRACKERS.
+        cmap_left, cmap_right, cmap_other (str): matplotlib colormap names.
+        shade_range (tuple[float, float]): colormap sample range per side.
+
+    Returns:
+        dict: {tracker: (r, g, b, a)}.
+    """
+    groups = {"L": [], "R": [], "_": []}
+    for t in trackers:
+        key = "L" if t.startswith("L") else "R" if t.startswith("R") else "_"
+        groups[key].append(t)
+    cmaps = {"L": plt.get_cmap(cmap_left), "R": plt.get_cmap(cmap_right), "_": plt.get_cmap(cmap_other)}
+
+    colors = {}
+    for key, names in groups.items():
+        if not names:
+            continue
+        shades = (np.linspace(*shade_range, len(names)) if len(names) > 1
+                 else np.array([np.mean(shade_range)]))
+        for name, s in zip(names, shades):
+            colors[name] = cmaps[key](s)
+    return colors
+
+
+def _side_legend_handles(colors, trackers):
+    """Left/Right/Midline proxy legend entries (one per side present, at
+    that side's median tracker's shade), shared by plot_skeleton_3d and
+    plot_skeleton_2d_sideview."""
+    from matplotlib.lines import Line2D
+    handles = []
+    for prefix, label in (("L", "left"), ("R", "right"), ("_", "midline")):
+        names = ([t for t in trackers if not t.startswith(("L", "R"))] if prefix == "_"
+                else [t for t in trackers if t.startswith(prefix)])
+        if not names:
+            continue
+        mid = names[len(names) // 2]
+        handles.append(Line2D([0], [0], color=colors[mid], lw=3, label=label))
+    return handles
+
+
+def _frame_stride(n, max_frames):
+    """Evenly-spaced stride that thins `n` frames down to at most
+    `max_frames` -- the "how densely to sample time" knob shared by
+    plot_skeleton_3d and plot_skeleton_2d_sideview. None/0 disables thinning."""
+    if not max_frames or n <= max_frames:
+        return 1
+    return int(np.ceil(n / max_frames))
+
+
+def plot_skeleton_3d(bone_segments, ax=None, colors=None, alpha_range=(0.15, 1.0),
+                      lw=1.0, max_frames=150):
+    """
+    Interactive 3-D skeleton over time: one fixed-length line segment per
+    tracker per frame (neuromotion.calc.get_bone_segments), alpha ramping
+    from `alpha_range[0]` (earliest frame) to `alpha_range[1]` (latest) to
+    show time evolution. Screen axes follow this project's room convention
+    (pos_x/pos_z ground plane, pos_y vertical): matplotlib's on-screen
+    x/y/z are set to pos_x / pos_z / pos_y respectively.
+
+    Drag-to-rotate / scroll-to-zoom needs a real GUI backend under the
+    figure -- plot_fullbody.py sets one (matplotlib.use("QtAgg")) before
+    importing pyplot, since a notebook/VS-Code-interactive kernel otherwise
+    defaults to a static inline backend for figures.
+
+    Parameters:
+        bone_segments (dict): from get_bone_segments (full sfreq resolution).
+        ax (Axes3D | None): 3-D axes to draw on; a new figure/axes if None.
+        colors (dict | None): {tracker: RGBA}, e.g. bone_color_map(trackers);
+            missing trackers fall back to gray.
+        alpha_range (tuple[float, float]): alpha at the first vs. last frame drawn.
+        lw (float): line width.
+        max_frames (int | None): thin every tracker's frames to at most this
+            many (evenly strided) before drawing -- the rendering-density
+            knob; None/0 draws every frame in bone_segments as-is.
+
+    Returns:
+        Axes3D
+    """
+    from mpl_toolkits.mplot3d.art3d import Line3DCollection
+    if ax is None:
+        fig = plt.figure(figsize=(8, 8))
+        ax = fig.add_subplot(111, projection="3d")
+
+    n_full = next(iter(bone_segments.values()))["start"].shape[0]
+    stride = _frame_stride(n_full, max_frames)
+
+    all_pts = []
+    for tracker, seg in bone_segments.items():
+        # world [pos_x, pos_y, pos_z] -> screen [x, y, z] so pos_y renders vertical
+        start = seg["start"][::stride, [0, 2, 1]]
+        end = seg["end"][::stride, [0, 2, 1]]
+        n = start.shape[0]
+        base = colors.get(tracker, (0.5, 0.5, 0.5, 1.0)) if colors else (0.5, 0.5, 0.5, 1.0)
+        rgba = np.tile(np.asarray(base, dtype=float), (n, 1))
+        rgba[:, 3] = np.linspace(*alpha_range, n) if n > 1 else alpha_range[1]
+        segs3d = np.stack([start, end], axis=1)   # (n, 2, 3)
+        ax.add_collection3d(Line3DCollection(segs3d, colors=rgba, linewidths=lw))
+        all_pts.append(start); all_pts.append(end)
+
+    pts = np.concatenate(all_pts, axis=0)
+    pts = pts[np.isfinite(pts).all(axis=1)]
+    ax.set_xlim(pts[:, 0].min(), pts[:, 0].max())
+    ax.set_ylim(pts[:, 1].min(), pts[:, 1].max())
+    ax.set_zlim(pts[:, 2].min(), pts[:, 2].max())
+    ranges = pts.max(axis=0) - pts.min(axis=0)
+    ax.set_box_aspect(tuple(max(r, 1e-6) for r in ranges))
+    ax.set_xlabel("pos_x (m)")
+    ax.set_ylabel("pos_z (m)")
+    ax.set_zlabel("pos_y — vertical (m)")
+
+    handles = _side_legend_handles(colors, list(bone_segments)) if colors else []
+    if handles:
+        ax.legend(handles=handles, loc="upper left", fontsize=9)
+    return ax
+
+
+def plot_skeleton_2d_sideview(bone_segments, direction_zx, origin_zx, ax=None,
+                               colors=None, alpha_range=(0.15, 1.0), lw=1.0,
+                               max_frames=150):
+    """
+    Same fixed-length bone segments flattened onto the sagittal plane
+    defined by a ground-plane heading (e.g. neuromotion.calc.heading_direction)
+    and the vertical: x = forward distance along `direction_zx` from
+    `origin_zx`, y = height (neuromotion.calc.project_ground_plane). Colors
+    and the time alpha-fade match plot_skeleton_3d so both views of the same
+    bout compare directly.
+
+    Parameters:
+        bone_segments (dict): from get_bone_segments (full sfreq resolution).
+        direction_zx, origin_zx (np.ndarray): (2,) heading / origin in
+            (pos_z, pos_x) order, from heading_direction / a tracker's own
+            get_bone_segments center at the window's first sample.
+        ax, colors, alpha_range, lw: as in plot_skeleton_3d.
+        max_frames (int | None): as in plot_skeleton_3d -- the
+            rendering-density knob, independent of the 3-D view's own.
+
+    Returns:
+        Axes
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(10, 5))
+
+    n_full = next(iter(bone_segments.values()))["start"].shape[0]
+    stride = _frame_stride(n_full, max_frames)
+
+    for tracker, seg in bone_segments.items():
+        f0, h0 = project_ground_plane(seg["start"][::stride], origin_zx, direction_zx)
+        f1, h1 = project_ground_plane(seg["end"][::stride], origin_zx, direction_zx)
+        n = f0.shape[0]
+        base = colors.get(tracker, (0.5, 0.5, 0.5, 1.0)) if colors else (0.5, 0.5, 0.5, 1.0)
+        rgba = np.tile(np.asarray(base, dtype=float), (n, 1))
+        rgba[:, 3] = np.linspace(*alpha_range, n) if n > 1 else alpha_range[1]
+        segs = np.stack([np.column_stack([f0, h0]), np.column_stack([f1, h1])], axis=1)
+        ax.add_collection(LineCollection(segs, colors=rgba, linewidths=lw))
+
+    ax.autoscale()
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.set_xlabel("forward distance along hip heading (m)")
+    ax.set_ylabel("height (m)")
+
+    handles = _side_legend_handles(colors, list(bone_segments)) if colors else []
+    if handles:
+        ax.legend(handles=handles, loc="best", fontsize=9)
     return ax
 
 

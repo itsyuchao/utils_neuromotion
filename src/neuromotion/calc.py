@@ -97,6 +97,147 @@ def calc_path_directions(data, smoothing=10):
 
     return directions
 
+def bone_direction_vectors(rot_deg, axis=(0.0, 1.0, 0.0), order="xyz"):
+    """
+    Rotate a fixed local axis by each row of Euler angles, returning unit
+    world-frame direction vectors -- turns a tracked bone's rot_xyz into a
+    drawable orientation.
+
+    Parameters:
+        rot_deg (np.ndarray): (n, 3) Euler angles in degrees, Motive's
+            exported Rotation X/Y/Z columns (syncpercept.io.read_motive_csv,
+            rotation=True).
+        axis (tuple): local axis to rotate, default +Y -- Motive's skeletal
+            bone convention has a bone's length running along its own local Y.
+        order (str): Euler rotation order matching Motive's export, consumed
+            by scipy.spatial.transform.Rotation.from_euler.
+
+    Returns:
+        np.ndarray: (n, 3) unit direction vectors; rows with any non-finite
+        input angle come back all-NaN.
+    """
+    from scipy.spatial.transform import Rotation
+    rot_deg = np.asarray(rot_deg, dtype=float)
+    directions = np.full_like(rot_deg, np.nan)
+    valid = np.isfinite(rot_deg).all(axis=1)
+    if valid.any():
+        r = Rotation.from_euler(order, rot_deg[valid], degrees=True)
+        directions[valid] = r.apply(np.asarray(axis, dtype=float))
+    return directions
+
+def get_bone_segments(raw_motion, trackers, tmin=None, tmax=None,
+                       bone_length_m=0.10, axis=(0.0, 1.0, 0.0), order="xyz"):
+    """
+    Fixed-length 3-D line segment per tracker per frame, from a full-body
+    motion Raw carrying '{tracker}_pos_{x,y,z}' and '{tracker}_rot_{x,y,z}'
+    channels (sync_motion2rpi.write_motive_to_raw with ROTATION=True). Each
+    segment is centered on the tracker's pos_xyz sample and oriented by
+    rotating `axis` by that sample's rot_xyz (bone_direction_vectors).
+
+    Returns every sample in [tmin, tmax] at full sfreq -- this is pure
+    geometry, not a plot; how densely to actually DRAW those frames is a
+    rendering decision, made by plot_skeleton_3d / plot_skeleton_2d_sideview's
+    own `max_frames`, not here.
+
+    Parameters:
+        raw_motion (mne.io.Raw): full-body motion recording.
+        trackers (list[str]): tracker names to extract (e.g. configs.FULLBODY_TRACKERS).
+        tmin, tmax (float | None): raw-relative seconds to crop to
+            (raw_motion.times); None keeps that edge.
+        bone_length_m (float): total segment length in meters (default 10 cm).
+        axis, order: forwarded to bone_direction_vectors.
+
+    Returns:
+        dict: {tracker: {"t": (n,) seconds (raw-relative, directly comparable
+        to tmin/tmax), "center": (n,3), "start": (n,3), "end": (n,3)}}, all
+        positions in meters, world frame (columns = pos_x, pos_y, pos_z).
+    """
+    seg = raw_motion.copy().crop(tmin=tmin, tmax=tmax)
+    t = seg.times + seg.first_time
+
+    out = {}
+    for tracker in trackers:
+        pos_ch = [f"{tracker}_pos_{a}" for a in "xyz"]
+        rot_ch = [f"{tracker}_rot_{a}" for a in "xyz"]
+        missing = [ch for ch in pos_ch + rot_ch if ch not in seg.ch_names]
+        if missing:
+            raise ValueError(
+                f"tracker '{tracker}' missing channel(s) {missing} -- was this "
+                f"fif written with sync_motion2rpi's ROTATION=True for rot_xyz?"
+            )
+        pos = seg.get_data(picks=pos_ch).T / 1000.0    # mm -> m, (n, 3)
+        rot = seg.get_data(picks=rot_ch).T              # degrees, (n, 3)
+        direction = bone_direction_vectors(rot, axis=axis, order=order)
+        half = direction * (bone_length_m / 2.0)
+        out[tracker] = {"t": t, "center": pos, "start": pos - half, "end": pos + half}
+    return out
+
+def heading_direction(raw_motion, tracker, tmin, tmax,
+                       motion_xy=("pos_z", "pos_x"), smoothing=10):
+    """
+    Single unit ground-plane heading vector for `tracker` over [tmin, tmax]
+    -- the "speed vector" bone segments get projected onto for a flattened
+    2-D sideview (project_ground_plane). Built on calc_path_directions
+    applied to the tracker's own (motion_xy) trajectory; per-sample headings
+    are circular-averaged into one representative direction for the whole
+    window, since gait sways step to step and a single bout-level heading is
+    more stable than any one instant. Not hip-specific -- pass whichever
+    tracker's own movement should define "forward" (usually the hip, but any
+    tracker works).
+
+    Parameters:
+        raw_motion (mne.io.Raw): full-body motion recording.
+        tracker (str): tracker whose ground-plane channels define heading.
+        tmin, tmax (float): raw-relative seconds bounding the window.
+        motion_xy (tuple[str, str]): ground-plane channel suffixes, in the
+            room-plane (x, y) convention used throughout this package.
+        smoothing (int): forwarded to calc_path_directions.
+
+    Returns:
+        np.ndarray: (2,) unit vector in `motion_xy` order.
+    """
+    picks = [f"{tracker}_{ax}" for ax in motion_xy]
+    seg = raw_motion.copy().crop(tmin=tmin, tmax=tmax)
+    missing = [ch for ch in picks if ch not in seg.ch_names]
+    if missing:
+        raise ValueError(f"tracker '{tracker}' missing channel(s) {missing}")
+    xy = seg.get_data(picks=picks).T / 1000.0
+    theta = calc_path_directions(xy, smoothing=smoothing)
+    theta = theta[np.isfinite(theta)]
+    if theta.size == 0:
+        raise ValueError(f"no valid heading samples for '{tracker}' in [{tmin}, {tmax}]")
+    direction = np.array([np.cos(theta).mean(), np.sin(theta).mean()])
+    norm = np.linalg.norm(direction)
+    if norm < 1e-9:
+        raise ValueError(f"heading direction degenerate (net displacement ~0) for '{tracker}'")
+    return direction / norm
+
+def project_ground_plane(points_xyz, origin_zx, direction_zx):
+    """
+    Flatten world points onto the sagittal plane defined by a ground-plane
+    heading (e.g. from hip_forward_axis) and the vertical (pos_y) -- the 2-D
+    "projected onto the speed vector" view of a 3-D skeleton.
+
+    Parameters:
+        points_xyz (np.ndarray): (..., 3) world points, columns
+            [pos_x, pos_y, pos_z] (get_bone_segments' column order).
+        origin_zx (np.ndarray): (2,) (pos_z, pos_x) point the heading is
+            measured from -- typically the hip's own ground-plane position at
+            the window's first sample.
+        direction_zx (np.ndarray): (2,) unit heading in (pos_z, pos_x) order
+            (hip_forward_axis with motion_xy=("pos_z", "pos_x")).
+
+    Returns:
+        forward, height (np.ndarray, np.ndarray): each (...,), meters.
+        forward is the origin-relative distance along direction_zx; height
+        is pos_y unchanged (the room's own floor-referenced vertical axis).
+    """
+    points_xyz = np.asarray(points_xyz, dtype=float)
+    zx = points_xyz[..., [2, 0]] - np.asarray(origin_zx, dtype=float)
+    forward = zx @ np.asarray(direction_zx, dtype=float)
+    height = points_xyz[..., 1]
+    return forward, height
+
 def interp_vector(column_vector, frames=250):
     """
     Resample a column vector to match a target size determined by duration and sampling rate.
