@@ -1,11 +1,10 @@
 from __future__ import annotations
-import datetime
 import logging
-import numpy as np
-import warnings
 import mne
 import matplotlib.pyplot as plt
+import pandas as pd
 from pathlib import Path
+from bids import BIDSLayout
 
 
 def save_fig(path: Path, fig=None):
@@ -15,268 +14,120 @@ def save_fig(path: Path, fig=None):
     plt.close(fig or plt.gcf())
 
 
-def assert_iso_synced(*raws, tolerance_s: float = 0.01, labels=None) -> None:
-    """Verify that all raws share start wallclock and duration to tolerance_s.
+# ---- iso time: every cross-stream window is given in a reference raw's
+# annotation frame (s since its meas_date) and moved between raws through
+# meas_date only ------------------------------------------------------------
 
-    Use this whenever downstream code (annotation copy, gait/cue cycle
-    cropping, event conversion) crosses raw boundaries. The check enforces
-    that ``meas_date + first_time`` and total duration agree across all
-    inputs, so subsequent code may treat raw-relative seconds as
-    interchangeable with wallclock-since-meas_date offsets.
-
-    Parameters
-    ----------
-    *raws : mne.io.BaseRaw
-        Two or more raws expected to be ISO-wallclock aligned (e.g. all
-        outputs of a single sync run for the same task).
-    tolerance_s : float
-        Max allowed mismatch in either start time or total duration.
-    labels : list[str] | None
-        Human-readable labels for error messages.
-
-    Raises
-    ------
-    ValueError
-        If ``meas_date`` is missing on any raw, or start time / duration
-        differ across raws by more than ``tolerance_s``.
-    """
-    if len(raws) < 2:
-        return
-    labels = list(labels) if labels else [f"raw{i}" for i in range(len(raws))]
-    if len(labels) != len(raws):
-        raise ValueError("labels length must match number of raws")
-
-    starts, durs = [], []
-    for r, lbl in zip(raws, labels):
-        md = r.info["meas_date"]
-        if md is None:
-            raise ValueError(
-                f"{lbl}.info['meas_date'] is None -- cannot verify ISO sync. "
-                f"Run the sync step that sets meas_date before chunking across raws."
-            )
-        starts.append(md + datetime.timedelta(seconds=r.first_time))
-        durs.append(r.times[-1])
-
-    s0, d0 = starts[0], durs[0]
-    for s, d, lbl in zip(starts[1:], durs[1:], labels[1:]):
-        ds = abs((s - s0).total_seconds())
-        dd = abs(d - d0)
-        if ds > tolerance_s:
-            raise ValueError(
-                f"start-wallclock mismatch beyond tolerance "
-                f"({ds:.4f}s > {tolerance_s}s): "
-                f"{labels[0]}={s0.isoformat()} vs {lbl}={s.isoformat()}"
-            )
-        if dd > tolerance_s:
-            raise ValueError(
-                f"duration mismatch beyond tolerance "
-                f"({dd:.4f}s > {tolerance_s}s): "
-                f"{labels[0]}={d0:.3f}s vs {lbl}={d:.3f}s"
-            )
+def get_iso_span(raw):
+    """(start, end) tz-aware wallclock of raw's first and last sample."""
+    start = pd.Timestamp(raw.info["meas_date"]) + pd.to_timedelta(raw.first_time, unit="s")
+    return start, start + pd.to_timedelta(raw.times[-1], unit="s")
 
 
-def assert_iso_overlap(*raws, labels=None) -> None:
-    """Verify that all raws overlap in absolute ISO wallclock time.
+def iso_to_onset(raw, iso):
+    """Wallclock -> raw's annotation frame (s since meas_date)."""
+    return (pd.Timestamp(iso) - pd.Timestamp(raw.info["meas_date"])).total_seconds()
 
-    Relaxed companion to :func:`assert_iso_synced`: instead of requiring
-    identical start wallclock and duration, this only requires that the
-    recordings' wallclock windows ``[meas_date + first_time, meas_date +
-    first_time + duration]`` mutually overlap. Use it when segmenting one raw
-    by another raw's annotations where the two are separate runs sharing only
-    a common time span (e.g. an iEEG run and a motion run recorded in the same
-    session). ``meas_date`` is authoritative for cross-raw conversion, so it
-    must be set on every input.
+
+def calc_iso_shift(raw_from, raw_to):
+    """Seconds to add to raw_from annotation-frame times to express them in
+    raw_to's annotation frame."""
+    return (raw_from.info["meas_date"] - raw_to.info["meas_date"]).total_seconds()
+
+
+def find_overlapping(span, paths, cover=False):
+    """fif paths whose iso span overlaps span=(start, end); cover=True keeps
+    only those fully covering it. Headers only."""
+    out = []
+    for p in paths:
+        s, e = get_iso_span(mne.io.read_raw_fif(p, preload=False, verbose="ERROR"))
+        if (s <= span[0] and span[1] <= e) if cover else (s <= span[1] and span[0] <= e):
+            out.append(p)
+    return out
+
+
+def assert_iso_synced(*raws, tolerance_s=0.01):
+    """Raise if raws differ in start wallclock or duration by > tolerance_s
+    (e.g. eeg / ieeg / motion cut from one sync run of the same task)."""
+    spans = [get_iso_span(r) for r in raws]
+    for (s, e), r in zip(spans[1:], raws[1:]):
+        ds = abs((s - spans[0][0]).total_seconds())
+        dd = abs((e - s).total_seconds() - (spans[0][1] - spans[0][0]).total_seconds())
+        if ds > tolerance_s or dd > tolerance_s:
+            raise ValueError(f"{r.info['description']}: start off by {ds:.4f}s, duration by {dd:.4f}s")
+
+
+def split_windows(periods, win_s):
+    """Split each (t0, t1) period into back-to-back win_s windows (remainder
+    dropped) -> DataFrame onset, duration, period_idx; input for crop_windows."""
+    return pd.DataFrame([(t0 + k * win_s, win_s, i) for i, (t0, t1) in enumerate(periods)
+                         for k in range(int((t1 - t0) // win_s))],
+                        columns=["onset", "duration", "period_idx"])
+
+
+def crop_windows(raw, windows, pad_s=0.0, raw_ref=None, mid=None, verbose=True):
+    """Crop padded segments of raw around each window -- the one cropper.
 
     Parameters
     ----------
-    *raws : mne.io.BaseRaw
-        Two or more raws expected to overlap in ISO wallclock time.
-    labels : list[str] | None
-        Human-readable labels for error messages.
-
-    Raises
-    ------
-    ValueError
-        If ``meas_date`` is missing on any raw, or the wallclock windows do
-        not all mutually overlap.
-    """
-    if len(raws) < 2:
-        return
-    labels = list(labels) if labels else [f"raw{i}" for i in range(len(raws))]
-    if len(labels) != len(raws):
-        raise ValueError("labels length must match number of raws")
-
-    starts, ends = [], []
-    for r, lbl in zip(raws, labels):
-        md = r.info["meas_date"]
-        if md is None:
-            raise ValueError(
-                f"{lbl}.info['meas_date'] is None -- cannot verify ISO overlap. "
-                f"Run the sync step that sets meas_date before chunking across raws."
-            )
-        start = md + datetime.timedelta(seconds=r.first_time)
-        starts.append(start)
-        ends.append(start + datetime.timedelta(seconds=r.times[-1]))
-
-    latest_start = max(starts)
-    earliest_end = min(ends)
-    if latest_start > earliest_end:
-        desc = ", ".join(
-            f"{lbl}=[{s.isoformat()}, {e.isoformat()}]"
-            for lbl, s, e in zip(labels, starts, ends)
-        )
-        raise ValueError(f"raws do not overlap in ISO wallclock time: {desc}")
-
-
-def antneuro_ucla_63ch() -> mne.channels.DigMontage:
-    """Custom 63-channel antNeuro montage used in the UCLA recordings.
-
-    Derived from MNE's biosemi64: drops the four channels not recorded
-    (Fpz, CPz, Iz, P9, P10) and adds the four h-suffixed temporal channels
-    (FTT9h, FTT10h, TPP9h, TPP10h) as the midpoint of their named
-    neighbors, shifted 1 cm inferior (z - 0.01).
-    """
-    base = mne.channels.make_standard_montage("biosemi64")
-    src = base.get_positions()["ch_pos"]
-    ch_pos = {k: v.copy() for k, v in src.items()}
-    for ch in ("Fpz", "CPz", "Iz", "P9", "P10"):
-        ch_pos.pop(ch, None)
-
-    def _mid_inferior(a, b, drop=0.01):
-        p = (np.asarray(src[a]) + np.asarray(src[b])) / 2.0
-        p[2] -= drop
-        return p
-
-    ch_pos["FTT9h"]  = _mid_inferior("FT7", "T7")
-    ch_pos["FTT10h"] = _mid_inferior("FT8", "T8")
-    ch_pos["TPP9h"]  = _mid_inferior("TP7", "P7")
-    ch_pos["TPP10h"] = _mid_inferior("TP8", "P8")
-
-    return mne.channels.make_dig_montage(ch_pos=ch_pos, coord_frame="head")
-
-
-def _reref_formula(reref_ch):
-    """Parse a sequential bipolar iEEG channel name into its source-contact
-    formula (pure string math, no data/inst involved).
-
-    The Percept device records three bipolar pairs per hemisphere from a
-    4-contact strip (contacts 0-3):
-        ZERO_THREE  = V0 - V3
-        ONE_THREE   = V1 - V3
-        ZERO_TWO    = V0 - V2
-    From these, the sequential pairs are derived as:
-        ZERO_ONE    = ZERO_THREE - ONE_THREE             (V0 - V1)
-        ONE_TWO     = ONE_THREE - ZERO_THREE + ZERO_TWO  (V1 - V2)
-        TWO_THREE   = ZERO_THREE - ZERO_TWO              (V2 - V3)
-
-    Parameters
-    ----------
-    reref_ch : str
-        Desired output channel, e.g. ``"ZERO_ONE_LEFT"`` (CONTACT_CONTACT_SIDE).
-        Valid contact pairs (order matters): ZERO_ONE, ONE_TWO, TWO_THREE.
+    windows : DataFrame with 'onset' / 'duration' (s, annotation frame of
+        raw_ref if given, else of raw). Every column is carried into that
+        window's info dict.
+    pad_s : buffer before/after each window, kept in the segment so a later
+        Morlet/Hilbert transform can trim it via cycle_start_idx/_end_idx.
+    mid : optional column (same frame as 'onset') stored as cycle_mid_idx,
+        e.g. 'right_onset' for gait cycles.
 
     Returns
     -------
-    list[(int, str)] | None
-        [(coeff, source_ch_name), ...] to sum, or None if reref_ch names a
-        reversed pair (e.g. ONE_ZERO) -- order matters for bipolar
-        re-referencing, so this warns and is skipped rather than an error.
+    epochs : list of Raw segments (pads included); windows whose padded span
+        leaves raw are dropped.
+    info : list of dict, 1:1 with epochs: the window's columns (onset in raw's
+        frame) + sfreq, pad_s, n_samples, cycle_start_idx, cycle_end_idx
+        [, cycle_mid_idx].
     """
-    contacts = ("ZERO", "ONE", "TWO", "THREE")
-    valid_pairs = {"ZERO_ONE", "ONE_TWO", "TWO_THREE"}
-    reversed_pairs = {"ONE_ZERO", "TWO_ONE", "THREE_TWO",
-                      "THREE_ZERO", "TWO_ZERO", "THREE_ONE"}
-
-    parts = reref_ch.upper().split("_")
-    if len(parts) != 3 or parts[0] not in contacts or parts[1] not in contacts:
-        raise ValueError(
-            f"reref_ch must be in the form CONTACT_CONTACT_SIDE "
-            f"(e.g. ZERO_ONE_LEFT), got '{reref_ch}'"
-        )
-    pair, side = f"{parts[0]}_{parts[1]}", parts[2]
-
-    if pair in reversed_pairs:
-        warnings.warn(
-            f"Reversed pair '{pair}' requested — order matters for bipolar "
-            f"re-referencing. Valid sequential pairs are: {sorted(valid_pairs)}. "
-            f"Skipping.",
-            UserWarning,
-            stacklevel=3,
-        )
-        return None
-    if pair not in valid_pairs:
-        raise ValueError(f"Unsupported pair '{pair}'. Valid pairs: {sorted(valid_pairs)}")
-
-    zero_three, one_three, zero_two = (f"ZERO_THREE_{side}", f"ONE_THREE_{side}", f"ZERO_TWO_{side}")
-    formulas = {
-        "ZERO_ONE":  [(1, zero_three), (-1, one_three)],
-        "ONE_TWO":   [(1, one_three), (-1, zero_three), (1, zero_two)],
-        "TWO_THREE": [(1, zero_three), (-1, zero_two)],
-    }
-    return formulas[pair]
+    sfreq = raw.info["sfreq"]
+    shift = 0.0 if raw_ref is None else calc_iso_shift(raw_ref, raw)
+    pad_samp = int(round(pad_s * sfreq))
+    epochs, info = [], []
+    for row in windows.to_dict("records"):
+        t0 = row["onset"] + shift - raw.first_time - pad_s
+        t1 = t0 + row["duration"] + 2 * pad_s
+        if t0 < 0 or t1 > raw.times[-1]:
+            continue
+        ep = raw.copy().crop(tmin=t0, tmax=t1, include_tmax=False)
+        ci = {**row, "onset": row["onset"] + shift, "sfreq": sfreq, "pad_s": pad_s,
+              "n_samples": ep.n_times, "cycle_start_idx": pad_samp,
+              "cycle_end_idx": ep.n_times - pad_samp}
+        if mid is not None:
+            ci["cycle_mid_idx"] = pad_samp + int(round((row[mid] - row["onset"]) * sfreq))
+        epochs.append(ep)
+        info.append(ci)
+    if verbose:
+        print(f"crop_windows: {len(epochs)}/{len(windows)} window(s) inside raw (pad_s={pad_s})")
+    return epochs, info
 
 
-def pick_or_reref(inst: mne.io.BaseRaw | mne.BaseEpochs, ieeg_picks: list[str] | str):
-    """Pick channels from inst, re-referencing any that don't exist as-is.
+def get_matched_window(raw_ref, raw, tmin, tmax, picks=None):
+    """raw's data over [tmin, tmax] given in raw_ref's annotation frame.
+    Returns (t, data): t in raw_ref's annotation frame, data (n_picks, n)."""
+    win = pd.DataFrame({"onset": [tmin], "duration": [tmax - tmin]})
+    (ep,), _ = crop_windows(raw.copy().pick(picks), win, raw_ref=raw_ref, verbose=False)
+    return ep.times + ep.first_time - calc_iso_shift(raw_ref, raw), ep.get_data()
 
-    Works on inst.copy() throughout rather than building a fresh Raw/Epochs
-    for the derived channels: every derived channel's data is computed first
-    (while every original source channel is still untouched -- sequential
-    bipolar formulas reuse source contacts across targets, e.g. ONE_TWO needs
-    the same ZERO_THREE/ZERO_TWO contacts as TWO_THREE, so overwriting one
-    target's carrier channel before all formulas are evaluated would corrupt
-    a still-needed source), then each result is written in place over a
-    spare (not requested) source channel, which is renamed to the derived
-    channel's name. The returned object is that same copy of inst, so
-    meas_date, annotations/events, description, and everything else about
-    inst's metadata carry over automatically -- there's nothing to copy by
-    hand, and nothing to get out of sync.
 
-    Note: because derived channels are carved out of inst's own spare
-    channels rather than added fresh, a call can't request both a raw
-    source contact AND a derived channel built from it in the same
-    `ieeg_picks` if that leaves too few spare channels to hold every
-    derived channel -- this raises ValueError rather than silently
-    dropping one.
-    """
-    picks_list = ieeg_picks if isinstance(ieeg_picks, list) else [ieeg_picks]
-    to_reref = {ch: _reref_formula(ch) for ch in picks_list if ch not in inst.ch_names}
-    to_reref = {ch: formula for ch, formula in to_reref.items() if formula is not None}
+def fmt_mmss_mmm(seconds: float) -> str:
+    m = int(seconds // 60)
+    s = seconds - m*60
+    return f"{m:02d}:{s:06.3f}"
 
-    out = inst.copy()
-    out.load_data()
 
-    # Compute every derived channel's data up front, before any carrier
-    # channel is overwritten (see docstring).
-    computed = {}
-    for ch, formula in to_reref.items():
-        needed = [src_ch for _, src_ch in formula]
-        missing = [src_ch for src_ch in needed if src_ch not in out.ch_names]
-        if missing:
-            raise ValueError(f"Source channels {missing} not found in inst.ch_names: {out.ch_names}")
-        data = out.get_data(picks=needed)  # (n_channels, n_times) or (n_epochs, n_channels, n_times)
-        ch_idx = {src_ch: i for i, src_ch in enumerate(needed)}
-        if isinstance(out, mne.BaseEpochs):
-            computed[ch] = sum(coeff * data[:, ch_idx[src_ch], :] for coeff, src_ch in formula)
-        else:
-            computed[ch] = sum(coeff * data[ch_idx[src_ch]] for coeff, src_ch in formula)
-
-    carriers = [ch for ch in out.ch_names if ch not in picks_list]
-    if len(carriers) < len(computed):
-        raise ValueError(
-            f"pick_or_reref repurposes inst's own channels in place and can't add new "
-            f"ones: need {len(computed)} spare channel(s) for {list(computed)}, only "
-            f"{len(carriers)} available ({carriers})"
-        )
-
-    for carrier, (ch, data) in zip(carriers, computed.items()):
-        idx = out.ch_names.index(carrier)
-        if isinstance(out, mne.BaseEpochs):
-            out._data[:, idx, :] = data
-        else:
-            out._data[idx] = data
-        out.rename_channels({carrier: ch})
-
-    if not any(ch in out.ch_names for ch in picks_list):
-        raise ValueError(f"No valid channels from {picks_list} in {inst.ch_names}")
-    return out.pick([ch for ch in picks_list if ch in out.ch_names])
+def list_saved_runs(derivs_root, subject, task="selflocation", datatype="ieeg", suffix="ieeg", extension=".fif"):
+    layout = BIDSLayout(derivs_root, derivatives=True, validate=False)
+    files = layout.get(
+        subject=subject, task=task, datatype=datatype, suffix=suffix, extension=extension,
+        return_type="filename"
+    )
+    # Extract run numbers from BIDS entities
+    runs = sorted({layout.parse_file_entities(f).get("run") for f in files})
+    return [r for r in runs if r is not None], files

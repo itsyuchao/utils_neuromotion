@@ -9,7 +9,12 @@ description = "for human eeg/ieeg time-frequency analysis with synchronized beha
 dependencies = [
   "numpy",
   "scipy",
-  "h5py"
+  "h5py",
+  "pandas",
+  "matplotlib",
+  "mne",
+  "mne-bids",
+  "pybids"
 ]
 
 [tool.setuptools]

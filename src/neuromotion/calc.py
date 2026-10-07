@@ -1,242 +1,35 @@
 from __future__ import annotations
 import numpy as np
-import pandas as pd
 import mne
 
 from pathlib import Path
-from neuromotion.io import pick_or_reref, save_fig
+from neuromotion.io import save_fig
+from neuromotion.percept import pick_or_reref
 from scipy.signal import find_peaks
 import matplotlib.pyplot as plt
 
-def calc_speed(data, diff_step=1, smoothing=10):
-    """
-    Compute Euclidean derivatives from x, y coordinates in a 2-column NumPy array.
-    Pads the start and end with NaN to maintain the same length.
-
-    Parameters:
-        data (np.ndarray): Input 2D NumPy array with two columns (x, y coordinates).
-        smoothing (int): Number of discrete values before and after to account for smoothing.
-
-    Returns:
-        np.ndarray: 1D array of Euclidean derivatives.
-    """
-    if data.ndim != 2 or data.shape[1] != 2:
-        raise ValueError("Input must be a 2D NumPy array with two columns (x, y coordinates).")
-
-    derivatives = np.empty(data.shape[0], dtype=np.float64)
-    derivatives[:] = np.nan  # Initialize with NaN for padding
-
-    # Compute finite differences for Euclidean distance
-    dx = data[diff_step:, 0] - data[:-diff_step, 0]
-    dy = data[diff_step:, 1] - data[:-diff_step, 1]
-    derivatives[diff_step//2:-(diff_step//2 + diff_step%2)] = np.sqrt(dx**2 + dy**2) / 2
-
-    # Smooth with a kernel 
-    derivatives = np.convolve(derivatives, np.ones(smoothing)/smoothing, mode='same')
-    return derivatives
-
-def calc_speed_from_raw(raw_motion, motion_xy=("pos_z", "pos_x"), speed_smooth_s=0.2):
-    """
-    Compute walking speed (m/s) from two position channels on an mne Raw.
-
-    Position channels are read in mm and converted to meters; speed is the
-    magnitude of the numerical derivative (np.gradient at the raw's sfreq),
-    optionally smoothed with a moving-average of length speed_smooth_s (s).
-
-    Returns
-    -------
-    x, y : np.ndarray, shape (n_times,) -- positions in meters
-    speed : np.ndarray, shape (n_times,) -- speed in m/s
-    """
-    sfreq = float(raw_motion.info["sfreq"])
-    picks = mne.pick_channels(raw_motion.ch_names, include=list(motion_xy))
-    if len(picks) != 2:
-        raise ValueError(f"Missing channels {motion_xy} in raw_motion.ch_names")
-
-    data = raw_motion.get_data(picks=picks)  # (2, n_time) in mm
-    x, y = data[0] / 1000.0, data[1] / 1000.0
-
-    dt = 1.0 / sfreq
-    dx, dy = np.gradient(x, dt), np.gradient(y, dt)
-    speed = np.sqrt(dx**2 + dy**2)
-
-    if speed_smooth_s and speed_smooth_s > 0:
-        win = max(1, int(round(speed_smooth_s * sfreq)))
-        speed = np.convolve(speed, np.ones(win) / win, mode="same")
-
-    return x, y, speed
+def calc_moving_average(x, win_n, axis=-1, reflect_type="odd"):
+    """Centered moving average over win_n samples along axis. Edges are
+    padded by reflection instead of zeros: "odd" (point symmetry about the
+    end sample) keeps a linear trend such as a walking path, "even" (mirror)
+    suits non-negative signals such as speed."""
+    x = np.moveaxis(np.asarray(x, dtype=float), axis, -1)
+    win_n = max(1, int(win_n))
+    pad = [(0, 0)] * (x.ndim - 1) + [(win_n // 2, win_n // 2)]
+    xp = np.pad(x, pad, mode="reflect", reflect_type=reflect_type)
+    kernel = np.ones(win_n) / win_n
+    out = np.apply_along_axis(lambda v: np.convolve(v, kernel, mode="valid"), -1, xp)[..., :x.shape[-1]]
+    return np.moveaxis(out, -1, axis)
 
 
-def calc_path_directions(data, smoothing=10):
-    """
-    Compute the direction of the path in radians using displacement in x and y directions.
-    Handles cases where movement is predominantly in a straight line.
+def calc_bin_means(x, bin_n, axis=-1):
+    """Mean of consecutive non-overlapping bin_n-sample bins along axis
+    (trailing remainder dropped)."""
+    x = np.moveaxis(np.asarray(x, dtype=float), axis, -1)
+    n = (x.shape[-1] // bin_n) * bin_n
+    out = x[..., :n].reshape(*x.shape[:-1], -1, bin_n).mean(axis=-1)
+    return np.moveaxis(out, -1, axis)
 
-    Parameters:
-        data (np.ndarray): Input 2D NumPy array with two columns (x, y coordinates).
-        smoothing (int): Number of points to use for smoothing.
-
-    Returns:
-        np.ndarray: 1D array of directions in radians.
-    """
-    if data.ndim != 2 or data.shape[1] != 2:
-        raise ValueError("Input must be a 2D NumPy array with two columns (x, y coordinates).")
-
-    directions = np.empty(data.shape[0], dtype=np.float64)
-    directions[:] = np.nan
-
-    # Compute displacement in x and y directions
-    dx = data[smoothing:, 0] - data[:-smoothing, 0]
-    dy = data[smoothing:, 1] - data[:-smoothing, 1]
-
-    # Calculate directions for the valid range
-    valid_directions = np.arctan2(dy, dx)
-    valid_directions = (valid_directions + 2 * np.pi) % (2 * np.pi)
-    pad = smoothing // 2
-    directions[pad:pad + len(valid_directions)] = valid_directions
-
-    return directions
-
-def bone_direction_vectors(rot_deg, axis=(0.0, 1.0, 0.0), order="xyz"):
-    """
-    Rotate a fixed local axis by each row of Euler angles, returning unit
-    world-frame direction vectors -- turns a tracked bone's rot_xyz into a
-    drawable orientation.
-
-    Parameters:
-        rot_deg (np.ndarray): (n, 3) Euler angles in degrees, Motive's
-            exported Rotation X/Y/Z columns (syncpercept.io.read_motive_csv,
-            rotation=True).
-        axis (tuple): local axis to rotate, default +Y -- Motive's skeletal
-            bone convention has a bone's length running along its own local Y.
-        order (str): Euler rotation order matching Motive's export, consumed
-            by scipy.spatial.transform.Rotation.from_euler.
-
-    Returns:
-        np.ndarray: (n, 3) unit direction vectors; rows with any non-finite
-        input angle come back all-NaN.
-    """
-    from scipy.spatial.transform import Rotation
-    rot_deg = np.asarray(rot_deg, dtype=float)
-    directions = np.full_like(rot_deg, np.nan)
-    valid = np.isfinite(rot_deg).all(axis=1)
-    if valid.any():
-        r = Rotation.from_euler(order, rot_deg[valid], degrees=True)
-        directions[valid] = r.apply(np.asarray(axis, dtype=float))
-    return directions
-
-def get_bone_segments(raw_motion, trackers, tmin=None, tmax=None,
-                       bone_length_m=0.10, axis=(0.0, 1.0, 0.0), order="xyz"):
-    """
-    Fixed-length 3-D line segment per tracker per frame, from a full-body
-    motion Raw carrying '{tracker}_pos_{x,y,z}' and '{tracker}_rot_{x,y,z}'
-    channels (sync_motion2rpi.write_motive_to_raw with ROTATION=True). Each
-    segment is centered on the tracker's pos_xyz sample and oriented by
-    rotating `axis` by that sample's rot_xyz (bone_direction_vectors).
-
-    Returns every sample in [tmin, tmax] at full sfreq -- this is pure
-    geometry, not a plot; how densely to actually DRAW those frames is a
-    rendering decision, made by plot_skeleton_3d / plot_skeleton_2d_sideview's
-    own `max_frames`, not here.
-
-    Parameters:
-        raw_motion (mne.io.Raw): full-body motion recording.
-        trackers (list[str]): tracker names to extract (e.g. configs.FULLBODY_TRACKERS).
-        tmin, tmax (float | None): raw-relative seconds to crop to
-            (raw_motion.times); None keeps that edge.
-        bone_length_m (float): total segment length in meters (default 10 cm).
-        axis, order: forwarded to bone_direction_vectors.
-
-    Returns:
-        dict: {tracker: {"t": (n,) seconds (raw-relative, directly comparable
-        to tmin/tmax), "center": (n,3), "start": (n,3), "end": (n,3)}}, all
-        positions in meters, world frame (columns = pos_x, pos_y, pos_z).
-    """
-    seg = raw_motion.copy().crop(tmin=tmin, tmax=tmax)
-    t = seg.times + seg.first_time
-
-    out = {}
-    for tracker in trackers:
-        pos_ch = [f"{tracker}_pos_{a}" for a in "xyz"]
-        rot_ch = [f"{tracker}_rot_{a}" for a in "xyz"]
-        missing = [ch for ch in pos_ch + rot_ch if ch not in seg.ch_names]
-        if missing:
-            raise ValueError(
-                f"tracker '{tracker}' missing channel(s) {missing} -- was this "
-                f"fif written with sync_motion2rpi's ROTATION=True for rot_xyz?"
-            )
-        pos = seg.get_data(picks=pos_ch).T / 1000.0    # mm -> m, (n, 3)
-        rot = seg.get_data(picks=rot_ch).T              # degrees, (n, 3)
-        direction = bone_direction_vectors(rot, axis=axis, order=order)
-        half = direction * (bone_length_m / 2.0)
-        out[tracker] = {"t": t, "center": pos, "start": pos - half, "end": pos + half}
-    return out
-
-def heading_direction(raw_motion, tracker, tmin, tmax,
-                       motion_xy=("pos_z", "pos_x"), smoothing=10):
-    """
-    Single unit ground-plane heading vector for `tracker` over [tmin, tmax]
-    -- the "speed vector" bone segments get projected onto for a flattened
-    2-D sideview (project_ground_plane). Built on calc_path_directions
-    applied to the tracker's own (motion_xy) trajectory; per-sample headings
-    are circular-averaged into one representative direction for the whole
-    window, since gait sways step to step and a single bout-level heading is
-    more stable than any one instant. Not hip-specific -- pass whichever
-    tracker's own movement should define "forward" (usually the hip, but any
-    tracker works).
-
-    Parameters:
-        raw_motion (mne.io.Raw): full-body motion recording.
-        tracker (str): tracker whose ground-plane channels define heading.
-        tmin, tmax (float): raw-relative seconds bounding the window.
-        motion_xy (tuple[str, str]): ground-plane channel suffixes, in the
-            room-plane (x, y) convention used throughout this package.
-        smoothing (int): forwarded to calc_path_directions.
-
-    Returns:
-        np.ndarray: (2,) unit vector in `motion_xy` order.
-    """
-    picks = [f"{tracker}_{ax}" for ax in motion_xy]
-    seg = raw_motion.copy().crop(tmin=tmin, tmax=tmax)
-    missing = [ch for ch in picks if ch not in seg.ch_names]
-    if missing:
-        raise ValueError(f"tracker '{tracker}' missing channel(s) {missing}")
-    xy = seg.get_data(picks=picks).T / 1000.0
-    theta = calc_path_directions(xy, smoothing=smoothing)
-    theta = theta[np.isfinite(theta)]
-    if theta.size == 0:
-        raise ValueError(f"no valid heading samples for '{tracker}' in [{tmin}, {tmax}]")
-    direction = np.array([np.cos(theta).mean(), np.sin(theta).mean()])
-    norm = np.linalg.norm(direction)
-    if norm < 1e-9:
-        raise ValueError(f"heading direction degenerate (net displacement ~0) for '{tracker}'")
-    return direction / norm
-
-def project_ground_plane(points_xyz, origin_zx, direction_zx):
-    """
-    Flatten world points onto the sagittal plane defined by a ground-plane
-    heading (e.g. from hip_forward_axis) and the vertical (pos_y) -- the 2-D
-    "projected onto the speed vector" view of a 3-D skeleton.
-
-    Parameters:
-        points_xyz (np.ndarray): (..., 3) world points, columns
-            [pos_x, pos_y, pos_z] (get_bone_segments' column order).
-        origin_zx (np.ndarray): (2,) (pos_z, pos_x) point the heading is
-            measured from -- typically the hip's own ground-plane position at
-            the window's first sample.
-        direction_zx (np.ndarray): (2,) unit heading in (pos_z, pos_x) order
-            (hip_forward_axis with motion_xy=("pos_z", "pos_x")).
-
-    Returns:
-        forward, height (np.ndarray, np.ndarray): each (...,), meters.
-        forward is the origin-relative distance along direction_zx; height
-        is pos_y unchanged (the room's own floor-referenced vertical axis).
-    """
-    points_xyz = np.asarray(points_xyz, dtype=float)
-    zx = points_xyz[..., [2, 0]] - np.asarray(origin_zx, dtype=float)
-    forward = zx @ np.asarray(direction_zx, dtype=float)
-    height = points_xyz[..., 1]
-    return forward, height
 
 def interp_vector(column_vector, frames=250):
     """
@@ -256,191 +49,62 @@ def interp_vector(column_vector, frames=250):
     resampled_vector = np.interp(target_indices, original_indices, column_vector)
     return resampled_vector
 
-def trial_speed_matrix(raw_motion, windows, duration_s, motion_xy=("pos_z", "pos_x"),
-                       speed_smooth_s=0.2, window_s=0.1):
+def extract_band_power(signal, l_freq, h_freq, sfreq=250, method='morlet', rescale=None, baseline=None, n_jobs=4):
     """
-    Stack per-window speed traces from one raw into an (n_windows, n_bins)
-    matrix. Each row is resampled (via interp_vector) onto a common axis
-    spanning [0, duration_s], so windows of slightly different recorded
-    length (timing jitter) still align to the same nominal time axis.
-
-    Parameters
-    ----------
-    windows : list of (tmin, tmax)
-        Same time base as raw_motion.annotations onset (i.e. relative to
-        raw_motion.first_time).
-    duration_s : float
-        Nominal window duration (s) shared by every row's time axis.
-    window_s : float
-        Bin width (s) of the shared time axis; n_bins = round(duration_s / window_s).
-
-    Returns
-    -------
-    mat : np.ndarray, shape (len(windows), n_bins)
-    """
-    sfreq = float(raw_motion.info["sfreq"])
-    _, _, speed = calc_speed_from_raw(raw_motion, motion_xy=motion_xy, speed_smooth_s=speed_smooth_s)
-    n_bins = round(duration_s / window_s)
-
-    rows = []
-    for tmin, tmax in windows:
-        i0 = round((tmin - raw_motion.first_time) * sfreq)
-        i1 = round((tmax - raw_motion.first_time) * sfreq)
-        rows.append(interp_vector(speed[i0:i1], frames=n_bins))
-    return np.array(rows)
-
-
-def cycle_info_to_df(cycle_info):
-    """Tidy per-cycle DataFrame from annot_gait_cycles' cycle_info list (one
-    dict per gait cycle) -- one row per cycle with cycle_onset_s / cycle_dur_s
-    (the left swing's onset/full-stride duration) and right_onset_s (the
-    right swing's own onset, reconstructed from cycle_mid_idx --
-    cycle_start_idx converted back to seconds), all raw-relative on the same
-    time base as raw_motion.annotations onset. Also carries the per-side step
-    metrics annot_gait_cycles reads off the swing annotations:
-    left_step_dur_s / right_step_dur_s and left_step_length_m /
-    right_step_length_m. Positional 1:1 with cycle_info (and so with the
-    epochs list annot_gait_cycles returns alongside it) -- callers needing
-    cue tags or other per-cycle metadata concat their own columns alongside
-    this frame rather than this function reaching into raw.annotations
-    itself, keeping it decoupled from any particular annotation schema."""
-    return pd.DataFrame({
-        "cycle_onset_s":       [c["onset"]              for c in cycle_info],
-        "cycle_dur_s":         [c["duration"]            for c in cycle_info],
-        "right_onset_s":       [c["onset"] + (c["cycle_mid_idx"] - c["cycle_start_idx"]) / c["sfreq"]
-                                                          for c in cycle_info],
-        "left_step_dur_s":     [c["left_step_dur_s"]     for c in cycle_info],
-        "right_step_dur_s":    [c["right_step_dur_s"]    for c in cycle_info],
-        "left_step_length_m":  [c["left_step_length_m"]  for c in cycle_info],
-        "right_step_length_m": [c["right_step_length_m"] for c in cycle_info],
-    })
-
-
-def trial_cycle_matrix(cycle_onsets_s, cycle_values, windows, duration_s,
-                       cycle_durs_s=None, window_s=0.1, agg="mean"):
-    """
-    Bin sparse per-cycle scalar values (e.g. step length, step duration, an
-    asymmetry index) onto a common nominal per-trial time axis -- the
-    per-cycle-event analog of trial_speed_matrix's continuous-signal
-    resampling.
-
-    Each row is one window (tmin, tmax). By default (cycle_durs_s=None) a
-    cycle whose onset falls inside [tmin, tmax) is linearly rescaled onto
-    [0, duration_s) and dropped into that single nominal bin -- a point
-    event. Pass cycle_durs_s to instead paint every bin the cycle's own
-    [onset, onset + duration) interval overlaps (rescaled the same way) with
-    its value -- e.g. so a step's own swing duration renders as a wide mark
-    spanning the time it actually took, rather than a single-bin spike.
-    Bins with no contributing cycle are NaN (not 0 -- callers should render
-    NaN as a visually distinct "no data" color rather than a real low
-    value); bins with more than one contributing cycle are aggregated with
-    `agg`.
-
-    Parameters
-    ----------
-    cycle_onsets_s : array, shape (n_cycles,)
-        Cycle onsets on the same raw-relative time base as `windows` (e.g.
-        cycle_info_to_df's "cycle_onset_s" / "right_onset_s").
-    cycle_values : array, shape (n_cycles,)
-        Per-cycle scalar to bin, same length/order as cycle_onsets_s. Pass
-        two side-by-side (onset, value) arrays concatenated together (e.g.
-        left + right step length, each at its own side's onset) to pool
-        both into one row instead of keeping them in separate matrices.
-    windows : list of (tmin, tmax)
-        Same time base as raw_motion.annotations onset.
-    duration_s : float
-        Nominal window duration (s) shared by every row's time axis.
-    cycle_durs_s : array, shape (n_cycles,), optional
-        Per-cycle interval length (s), same length/order as
-        cycle_onsets_s; when given, paints the cycle's whole
-        [onset, onset + duration) span instead of a single point.
-    window_s : float
-        Bin width (s) of the shared time axis; n_bins = round(duration_s / window_s).
-    agg : "mean" | "median"
-        Aggregator applied when more than one cycle contributes to the same bin.
-
-    Returns
-    -------
-    mat : np.ndarray, shape (len(windows), n_bins)
-    """
-    cycle_onsets_s = np.asarray(cycle_onsets_s, dtype=float)
-    cycle_values   = np.asarray(cycle_values, dtype=float)
-    if cycle_durs_s is not None:
-        cycle_durs_s = np.asarray(cycle_durs_s, dtype=float)
-    n_bins = round(duration_s / window_s)
-    agg_fn = {"mean": np.nanmean, "median": np.nanmedian}[agg]
-
-    mat = np.full((len(windows), n_bins), np.nan)
-    for r, (tmin, tmax) in enumerate(windows):
-        span = tmax - tmin
-        in_win = (cycle_onsets_s >= tmin) & (cycle_onsets_s < tmax)
-        if not np.any(in_win):
-            continue
-        onsets = cycle_onsets_s[in_win]
-        vals   = cycle_values[in_win]
-        starts = np.clip(((onsets - tmin) / span * n_bins).astype(int), 0, n_bins - 1)
-        if cycle_durs_s is None:
-            ends = starts
-        else:
-            ends = np.clip((((onsets + cycle_durs_s[in_win]) - tmin) / span * n_bins).astype(int),
-                           0, n_bins - 1)
-
-        bin_hits = {}
-        for b0, b1, v in zip(starts, ends, vals):
-            for b in range(b0, b1 + 1):
-                bin_hits.setdefault(b, []).append(v)
-        for b, vs in bin_hits.items():
-            mat[r, b] = agg_fn(vs)
-    return mat
-
-
-def calc_step_length(pelvis, l_foot, r_foot, smoothing=1):
-    """
-    Compute the projection of foot positions onto the pelvis movement direction.
+    Extract band power from a n_trial x n_channel x n_sample signal array. n_trial and n_channel can be none.
 
     Parameters:
-        pelvis (np.ndarray): Array of pelvis positions with shape (n, 2) for x, y coordinates.
-        l_foot (np.ndarray): Array of left foot positions with shape (n, 3) for x, y, z coordinates.
-        r_foot (np.ndarray): Array of right foot positions with shape (n, 3) for x, y, z coordinates.
-        smoothing (int): Window size for smoothing the projections.
+        signal (np.ndarray): 3D array containing the signal data (n_trial, n_channel, n_sample).
+        l_freq (float): Lower frequency of the band in Hz.
+        h_freq (float): Upper frequency of the band in Hz.
+        sfreq (float): Sampling frequency of the signal in Hz. Default is 250 Hz.
+        method (str): Method to use for power calculation ('morlet' or 'hilbert').
+        rescale (str): Output type ('sd', 'zscore', or None). Default is None.
 
     Returns:
-        tuple: Two 1D arrays containing left and right foot projections onto pelvis direction.
+        band_power: Band power in the specified frequency range of same shape as input signal.
     """
-    if pelvis.shape[0] != l_foot.shape[0] or pelvis.shape[0] != r_foot.shape[0]:
-        raise ValueError("All input arrays must have the same number of frames.")
-
-    if pelvis.shape[1] != 2:
-        raise ValueError("Pelvis data must be 2D (x,y coordinates).")
-
-    if l_foot.shape[1] != 3 or r_foot.shape[1] != 3:
-        raise ValueError("Foot data must be 3D (x,y,z coordinates).")
+    if signal.ndim == 1:
+        signal = signal[np.newaxis, np.newaxis, :]
+    elif signal.ndim == 2:
+        signal = signal[np.newaxis, :, :]
+    elif signal.ndim == 3:
+        signal = signal
+    else:
+        raise ValueError("Input signal must be 1-3D array.")
     
-    # Step 1: Pelvis velocity direction (frame-by-frame)
-    pelvis_dir = np.diff(pelvis, axis=0, prepend=pelvis[0:1]) 
-    norms = np.linalg.norm(pelvis_dir, axis=1, keepdims=True) 
-    norms[norms == 0] = 1  # Prevent division by zero
-    pelvis_dir_norm = pelvis_dir / norms
+    if method == 'morlet': 
+        exponents = np.arange(0, 7, 0.1)
+        freqs = 2 ** exponents
+        freqs = freqs[freqs <= 90]
+        freq_indices = np.where((freqs >= l_freq) & (freqs <= h_freq))[0]
+        power = apply_morlet(signal, sfreq=sfreq, freqs=freqs[freq_indices], n_jobs=n_jobs)
+        band_power = np.mean(power, axis=-2).squeeze()  # Average across selected frequencies
+    
+    elif method == 'hilbert': 
+        from scipy.signal import firwin, filtfilt, hilbert
+        # Design FIR bandpass filter
+        width = 1  # Transition width in Hz
+        filter_order = int(sfreq / width)
+        # Make filter order odd for zero-phase filtering
+        filter_order += 1 if filter_order % 2 == 0 else 0
 
-    # Step 2: Convert pelvis direction and positions to 3D but mask out treadmill area
-    pelvis_dir_norm_3d = np.column_stack((pelvis_dir_norm[:, 0], np.zeros(pelvis.shape[0]), pelvis_dir_norm[:, 1]))
-    pelvis_3d = np.column_stack((pelvis[:, 0], np.zeros(pelvis.shape[0]), pelvis[:, 1]))
-    mask = (np.abs(pelvis[:,0])<0.5)&(np.abs(pelvis[:,1])<0.5)
-    pelvis_dir_norm_3d[mask] = [1,0,0] # Set to forward direction if mask is true (around treadmill at origin)
+        # Create FIR filter coefficients
+        b = firwin(filter_order, [l_freq, h_freq], pass_zero='bandpass', fs=sfreq)
 
-    # Step 3: Egocentric foot position
-    l_foot_ego = l_foot - pelvis_3d
-    r_foot_ego = r_foot - pelvis_3d
+        # Filter each channel using zero-phase filtering
+        filtered_signal = filtfilt(b, 1.0, signal, axis=-1) 
 
-    # Step 4: Projection of foot position onto pelvis direction
-    l_step = np.sum(l_foot_ego * pelvis_dir_norm_3d, axis=1)
-    r_step = np.sum(r_foot_ego * pelvis_dir_norm_3d, axis=1)
+        # Apply Hilbert transform to get the analytic signal
+        analytic_signal = hilbert(filtered_signal, axis=-1)
 
-    # Step 5: Smooth the projections
-    l_step = np.convolve(l_step, np.ones(smoothing)/smoothing, mode='same')
-    r_step = np.convolve(r_step, np.ones(smoothing)/smoothing, mode='same')
+        # Calculate band power (squared magnitude)
+        band_power = np.abs(analytic_signal)**2
+        band_power = band_power.squeeze()
 
-    return l_step, r_step
+    if rescale is not None:
+        band_power = baseline_correct(band_power, baseline=baseline, rescale=rescale)
+    return band_power # should be same dimension as input signal 
 
 def calc_band_power_traces(
     epochs: mne.Epochs,
@@ -511,62 +175,6 @@ def calc_band_power_traces(
 
     raise ValueError("combine_channels must be 'mean' or 'separate'")
 
-def extract_band_power(signal, l_freq, h_freq, sfreq=250, method='morlet', rescale=None, baseline=None, n_jobs=4):
-    """
-    Extract band power from a n_trial x n_channel x n_sample signal array. n_trial and n_channel can be none.
-
-    Parameters:
-        signal (np.ndarray): 3D array containing the signal data (n_trial, n_channel, n_sample).
-        l_freq (float): Lower frequency of the band in Hz.
-        h_freq (float): Upper frequency of the band in Hz.
-        sfreq (float): Sampling frequency of the signal in Hz. Default is 250 Hz.
-        method (str): Method to use for power calculation ('morlet' or 'hilbert').
-        rescale (str): Output type ('sd', 'zscore', or None). Default is None.
-
-    Returns:
-        band_power: Band power in the specified frequency range of same shape as input signal.
-    """
-    if signal.ndim == 1:
-        signal = signal[np.newaxis, np.newaxis, :]
-    elif signal.ndim == 2:
-        signal = signal[np.newaxis, :, :]
-    elif signal.ndim == 3:
-        signal = signal
-    else:
-        raise ValueError("Input signal must be 1-3D array.")
-    
-    if method == 'morlet': 
-        exponents = np.arange(0, 7, 0.1)
-        freqs = 2 ** exponents
-        freqs = freqs[freqs <= 90]
-        freq_indices = np.where((freqs >= l_freq) & (freqs <= h_freq))[0]
-        power = apply_morlet(signal, sfreq=sfreq, freqs=freqs[freq_indices], n_jobs=n_jobs)
-        band_power = np.mean(power, axis=-2).squeeze()  # Average across selected frequencies
-    
-    elif method == 'hilbert': 
-        from scipy.signal import firwin, filtfilt, hilbert
-        # Design FIR bandpass filter
-        width = 1  # Transition width in Hz
-        filter_order = int(sfreq / width)
-        # Make filter order odd for zero-phase filtering
-        filter_order += 1 if filter_order % 2 == 0 else 0
-
-        # Create FIR filter coefficients
-        b = firwin(filter_order, [l_freq, h_freq], pass_zero='bandpass', fs=sfreq)
-
-        # Filter each channel using zero-phase filtering
-        filtered_signal = filtfilt(b, 1.0, signal, axis=-1) 
-
-        # Apply Hilbert transform to get the analytic signal
-        analytic_signal = hilbert(filtered_signal, axis=-1)
-
-        # Calculate band power (squared magnitude)
-        band_power = np.abs(analytic_signal)**2
-        band_power = band_power.squeeze()
-
-    if rescale is not None:
-        band_power = baseline_correct(band_power, baseline=baseline, rescale=rescale)
-    return band_power # should be same dimension as input signal 
 
 def extract_band_phase(signal, l_freq, h_freq, sfreq=250, method='morlet', n_jobs=4):
     """
@@ -622,6 +230,7 @@ def extract_band_phase(signal, l_freq, h_freq, sfreq=250, method='morlet', n_job
 
     return band_phase # should be same dimension as input signal
 
+
 def interp_cycle(core, n_interp, mid=None):
     """
     Linearly interpolate a 1-D cycle core onto a length-``n_interp``
@@ -629,13 +238,13 @@ def interp_cycle(core, n_interp, mid=None):
 
     With ``mid`` (a sample index into ``core``, i.e. cycle_info's
     'cycle_mid_idx' re-expressed relative to 'cycle_start_idx' -- the
-    right-step onset from annot_gait_cycles), the two half-cycles are
+    right-step onset from crop_windows(mid='right_onset')), the two half-cycles are
     interpolated INDEPENDENTLY: ``core[:mid+1]`` onto the first
     ``n_interp//2`` output samples and ``core[mid:]`` onto the remaining
     ``n_interp - n_interp//2``, so the mid sample lands exactly on output
     sample ``n_interp//2`` in every cycle (left-step onset -> 0, right-step
     onset -> 1/2, next left-step onset -> 1). With ``mid=None`` the whole
-    core is interpolated uniformly (e.g. annot_cue_cycles info, which has
+    core is interpolated uniformly (e.g. split_windows / event windows, which have
     no mid anchor).
     """
     if mid is None:
@@ -663,7 +272,7 @@ def cycles_to_bandpower_matrix(epochs, cycle_info, ch_name,
     Build a (n_interp, n_cycles) band-power matrix from cycle epoch segments.
 
     ``epochs`` are NOT time-adjusted: they are full padded segments as
-    produced by ``annot_gait_cycles`` / ``annot_cue_cycles``. The pad
+    produced by ``io.crop_windows``. The pad
     indices live in ``cycle_info`` and are applied AFTER the frequency
     transform to avoid Morlet/Hilbert edge artifacts.
 
@@ -673,13 +282,13 @@ def cycles_to_bandpower_matrix(epochs, cycle_info, ch_name,
         3) crop pads with cycle_info[k]['cycle_start_idx':'cycle_end_idx']
         4) interp_cycle the core onto a length-``n_interp`` axis; when
            cycle_info carries 'cycle_mid_idx' (right-step onset sample,
-           annot_gait_cycles) the two halves are interpolated independently
+           crop_windows(mid=...)) the two halves are interpolated independently
            so that sample is anchored at n_interp//2 in every cycle
 
     Parameters
     ----------
     epochs : list of mne.io.RawArray
-        Padded segments (e.g. from annot_gait_cycles / annot_cue_cycles).
+        Padded segments (e.g. from io.crop_windows).
     cycle_info : list of dict
         One per epoch. Must carry 'sfreq', 'cycle_start_idx', 'cycle_end_idx'.
     ch_name : str | list of str
@@ -744,7 +353,7 @@ def cycles_to_tfr_stack(epochs, cycle_info, ch_name=None,
         4) crop pads with cycle_info[k]['cycle_start_idx':'cycle_end_idx']
         5) interp_cycle each freq row onto a length-``n_interp`` axis; when
            cycle_info carries 'cycle_mid_idx' (right-step onset sample,
-           annot_gait_cycles) the two halves are interpolated independently
+           crop_windows(mid=...)) the two halves are interpolated independently
            so that sample is anchored at n_interp//2 in every cycle
 
     Parameters
